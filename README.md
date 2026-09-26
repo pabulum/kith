@@ -37,9 +37,10 @@ Without `pstream up` running, `live` and `watch` run in the foreground (Ctrl-C
 stops them). With it running, they hand the request to it.
 
 Settings (player command, capture command, default latency, friends) live in
-`~/.config/pstream/config.toml` (`%APPDATA%\pstream\config.toml` on Windows). The identity key is `secret.key` next to it;
-lose it and friends have to re-add you. `--home <dir>` or `$PSTREAM_HOME` picks
-another state directory, which is how one machine can be several people.
+`~/.config/pstream/config.toml`, or `%APPDATA%\pstream\config.toml` on
+Windows. The identity key is `secret.key` next to it; lose it and friends have
+to re-add you. `--home <dir>` or `$PSTREAM_HOME` picks another state
+directory, which is how one machine can be several people.
 
 ## Test
 
