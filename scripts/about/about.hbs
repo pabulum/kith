@@ -1,0 +1,15 @@
+Third-party software in pstream
+===============================
+
+pstream is MIT-licensed (see LICENSE). It is built from the open source
+packages below. Each license text appears once, followed by the packages
+it covers.
+{{#each licenses}}
+
+------------------------------------------------------------------------
+{{{name}}}
+
+Used by: {{#each used_by}}{{{crate.name}}} {{{crate.version}}}{{#unless @last}}, {{/unless}}{{/each}}
+
+{{{text}}}
+{{/each}}
