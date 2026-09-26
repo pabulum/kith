@@ -23,6 +23,13 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# The desktop app. Not on Android, where pstream is a CLI in `adb shell`.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = "0.36"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
 # The moq stack comes from git, pinned to the exact revision iroh-live's
 # Cargo.lock uses (iroh-live bd5afc4 -> moq-dev/moq 6ab7d1a). crates.io's
 # moq-net 0.2.22 predates the API iroh-moq is written against, and moq-tokio

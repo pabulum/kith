@@ -16,10 +16,17 @@ Windows can watch but can't stream yet. Linux can do both.
 
 ## Use
 
+`pstream` with no command opens a window. It shows your code, your friends and
+who's live, and has buttons for adding friends, watching and going live. While
+it's open, it does what `pstream up` does, and the commands below talk to it.
+On Windows, double-click `pstream.exe`; if the window can't open, a dialog
+names the log to send.
+
 ```sh
 cargo build --release
 alias pstream=./target/release/pstream
 
+pstream                                  # the window
 pstream id                               # your code; send it to your friend
 pstream friend add sam <sam's code>      # they add yours too, or neither side connects
 pstream friend set sam --auto-open       # open mpv when sam goes live instead of notifying

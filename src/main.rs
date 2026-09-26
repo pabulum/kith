@@ -2,32 +2,43 @@
 //!
 //! See MANIFEST.md for where this is going and README.md for how to use it.
 
+// Release builds on Windows are GUI programs, so double-clicking one opens no
+// console window. `attach_console` gives subcommands their terminal back.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod config;
 mod control;
+#[cfg(not(target_os = "android"))]
+mod gui;
 mod node;
 
-use std::{net::SocketAddr, path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, sync::Mutex};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use iroh::EndpointId;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 
 use crate::{
-    config::{Friend, Home, Latency},
+    config::{Home, Latency},
     control::{Request, Response},
     node::{Capture, Node, Role, Sink},
 };
 
 #[derive(Parser)]
-#[command(version, about = "Stream your screen to friends, peer to peer")]
+#[command(
+    version,
+    about = "Stream your screen to friends, peer to peer",
+    long_about = "Stream your screen to friends, peer to peer.\n\n\
+                  With no command, pstream opens its window, which keeps you reachable \
+                  like `pstream up`."
+)]
 struct Cli {
     /// State directory (identity, friends, settings). Two homes are two identities.
     #[arg(long, env = "PSTREAM_HOME", global = true)]
     home: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -90,21 +101,117 @@ enum FriendCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("pstream=info,warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
+fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_console();
     let cli = Cli::parse();
     let home = Home::resolve(cli.home)?;
-    let socket = home.socket_path();
-
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     match cli.command {
+        Some(command) => {
+            init_logging(None);
+            runtime.block_on(run(home, command))
+        }
+        None => app(runtime, home),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
+    // A window has no terminal to read on Windows, so the log also goes to a
+    // file a friend can send when something breaks, and panics go in it too.
+    let log = home.dir().join("pstream.log");
+    // The previous run's log survives one restart, which is usually when
+    // someone goes looking for it (and it holds the crash an OpenGL retry
+    // follows).
+    let _ = std::fs::rename(&log, log.with_extension("log.old"));
+    init_logging(std::fs::File::create(&log).ok());
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("{info}");
+        default_hook(info);
+    }));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gui::run(runtime, home)))
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("pstream crashed")));
+    let Err(err) = result else { return Ok(()) };
+    tracing::error!("{err:#}");
+    // Most window failures are the GPU driver refusing DX12 or Vulkan, and
+    // OpenGL often works where they don't. winit can't open a second event
+    // loop in one process, so the retry is a new one. By now the runtime is
+    // gone, and with it this node's endpoint and control socket.
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        let retry = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .env("WGPU_BACKEND", "gl")
+                .spawn()
+        });
+        match retry {
+            Ok(_) => {
+                tracing::info!("trying again with OpenGL");
+                return Ok(());
+            }
+            Err(retry_err) => tracing::error!("couldn't retry with OpenGL: {retry_err}"),
+        }
+    }
+    #[cfg(windows)]
+    message_box(&format!("{err:#}\n\nThe log is {}", log.display()));
+    Err(err)
+}
+
+/// Shows an error where a double-clicked program can: nothing else is on
+/// screen when the window fails to open.
+#[cfg(windows)]
+fn message_box(text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (text, title) = (wide(text), wide("pstream"));
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
+#[cfg(target_os = "android")]
+fn app(_: tokio::runtime::Runtime, _: Home) -> Result<()> {
+    use clap::CommandFactory;
+    Cli::command().print_help()?;
+    Ok(())
+}
+
+/// Logs to stderr, and to `file` as well when given.
+fn init_logging(file: Option<std::fs::File>) {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pstream=info,warn"));
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+    match file {
+        Some(file) => subscriber
+            .with_ansi(false)
+            .with_writer(std::io::stderr.and(Mutex::new(file)))
+            .init(),
+        None => subscriber.with_writer(std::io::stderr).init(),
+    }
+}
+
+/// A GUI-subsystem program starts with no console. Attaching to the one it was
+/// run from (if any) lets `pstream status` and friends print there; it fails
+/// harmlessly on a double-click, or when a console build already has one.
+#[cfg(windows)]
+fn attach_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: AttachConsole takes a process id and touches no memory of ours.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+async fn run(home: Home, command: Command) -> Result<()> {
+    let socket = home.socket_path();
+    match command {
         Command::Id => println!("{}", home.secret()?.public()),
         Command::Friend(command) => friend(&home, command).await?,
         Command::Up => up(home).await?,
@@ -248,32 +355,12 @@ async fn friend(home: &Home, command: FriendCommand) -> Result<()> {
             code,
             auto_open,
         } => {
-            let id = EndpointId::from_str(code.trim()).with_context(|| {
-                format!("{code:?} isn't a pstream code (`pstream id` prints one)")
-            })?;
-            if id == home.secret()?.public() {
-                bail!("that's your own code");
-            }
-            if let Some(existing) = config.friends.iter().find(|f| f.name == name) {
-                bail!("you already have a friend named {:?}", existing.name);
-            }
-            if let Some(existing) = config.friends.iter().find(|f| f.id().ok() == Some(id)) {
-                bail!("that code is already saved as {:?}", existing.name);
-            }
-            config.friends.push(Friend {
-                name: name.clone(),
-                code: id.to_string(),
-                auto_open,
-            });
+            config.add_friend(&name, &code, auto_open, home.secret()?.public())?;
             home.save(&config)?;
             println!("added {name}");
         }
         FriendCommand::Rm { name } => {
-            let before = config.friends.len();
-            config.friends.retain(|f| f.name != name);
-            if config.friends.len() == before {
-                bail!("no friend named {name:?}");
-            }
+            config.remove_friend(&name)?;
             home.save(&config)?;
             println!("removed {name}");
         }
@@ -292,11 +379,7 @@ async fn friend(home: &Home, command: FriendCommand) -> Result<()> {
             auto_open,
             no_auto_open,
         } => {
-            let friend = config
-                .friends
-                .iter_mut()
-                .find(|f| f.name == name)
-                .with_context(|| format!("no friend named {name:?}"))?;
+            let friend = config.friend_mut(&name)?;
             if auto_open || no_auto_open {
                 friend.auto_open = auto_open;
             }

@@ -99,7 +99,9 @@ fn index(friends: &[Friend]) -> Result<HashMap<EndpointId, Friend>> {
 }
 
 /// Where `pstream live` reads MPEG-TS from.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Capture {
     /// The `capture` command from config.toml (gpu-screen-recorder by default).
@@ -564,7 +566,8 @@ impl Node {
         }
     }
 
-    pub fn status(&self) -> String {
+    /// Who's online and live right now, in config.toml's friend order.
+    pub fn snapshot(&self) -> Snapshot {
         let config = self.config();
         // Read before taking `sessions`: `start_live` holds `live` while it dials,
         // which takes `sessions`, so holding both here in the other order could deadlock.
@@ -577,32 +580,90 @@ impl Node {
             .is_some_and(|live| !live.task.is_finished());
         let sessions = self.0.sessions.lock().unwrap();
         let live_friends = self.0.live_friends.lock().unwrap();
+        let watching = self.0.watching.lock().unwrap();
 
+        let friends = config
+            .friends
+            .into_iter()
+            .filter_map(|friend| {
+                let id = friend.id().ok()?;
+                let presence = match (sessions.contains_key(&id), live_friends.contains(&id)) {
+                    (_, true) => Presence::Live,
+                    (true, false) => Presence::Online,
+                    (false, false) => Presence::Offline,
+                };
+                Some(FriendState {
+                    path: sessions.get(&id).and_then(path_summary),
+                    watching: watching.contains(&live_path(id)),
+                    presence,
+                    friend,
+                })
+            })
+            .collect();
+        Snapshot {
+            code: self.id(),
+            live,
+            friends,
+        }
+    }
+
+    pub fn status(&self) -> String {
+        let snapshot = self.snapshot();
         let mut out = format!(
             "code: {}\nlive: {}\n",
-            self.id(),
-            if live { "yes" } else { "no" }
+            snapshot.code,
+            if snapshot.live { "yes" } else { "no" }
         );
-        if config.friends.is_empty() {
+        if snapshot.friends.is_empty() {
             out.push_str("friends: none yet (`pstream friend add <name> <code>`)\n");
         }
-        for friend in &config.friends {
-            let Ok(id) = friend.id() else { continue };
-            let state = match (sessions.contains_key(&id), live_friends.contains(&id)) {
-                (_, true) => "LIVE",
-                (true, false) => "online",
-                (false, false) => "offline",
+        for state in &snapshot.friends {
+            let presence = match state.presence {
+                Presence::Live => "LIVE",
+                Presence::Online => "online",
+                Presence::Offline => "offline",
             };
-            let path = sessions
-                .get(&id)
-                .and_then(path_summary)
+            let path = state
+                .path
+                .as_ref()
                 .map(|path| format!("  {path}"))
                 .unwrap_or_default();
-            let auto = if friend.auto_open { " (auto-open)" } else { "" };
-            out.push_str(&format!("  {:<16} {state:<8}{path}{auto}\n", friend.name));
+            let auto = if state.friend.auto_open {
+                " (auto-open)"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "  {:<16} {presence:<8}{path}{auto}\n",
+                state.friend.name
+            ));
         }
         out
     }
+}
+
+/// What [`Node::snapshot`] reports.
+pub struct Snapshot {
+    pub code: EndpointId,
+    /// We're streaming.
+    pub live: bool,
+    pub friends: Vec<FriendState>,
+}
+
+pub struct FriendState {
+    pub friend: Friend,
+    pub presence: Presence,
+    /// The session's network path, e.g. "direct, 18 ms", while connected.
+    pub path: Option<String>,
+    /// Their stream is open in a player (or file) here.
+    pub watching: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Offline,
+    Online,
+    Live,
 }
 
 /// A running broadcast. Dropping it stops the capture without a clean finish.
@@ -775,7 +836,14 @@ fn spawn_error(program: &str, role: &str, err: std::io::Error) -> anyhow::Error 
 }
 
 /// Shows a desktop notification with a Watch button; true if it was clicked.
+///
+/// Windows has no notify-send; there the log line (and the GUI's LIVE badge)
+/// is the notification.
 async fn notify(name: &str) -> bool {
+    if cfg!(windows) {
+        info!("{name} is live; `pstream watch {name}` opens the stream");
+        return false;
+    }
     let output = Command::new("notify-send")
         .args([
             "--app-name=pstream",

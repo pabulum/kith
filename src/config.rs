@@ -197,6 +197,58 @@ const DEFAULT_CAPTURE: [&str; 23] = [
 ];
 
 impl Config {
+    /// Adds a friend by the code their pstream shows them.
+    pub fn add_friend(
+        &mut self,
+        name: &str,
+        code: &str,
+        auto_open: bool,
+        own: EndpointId,
+    ) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("give your friend a name");
+        }
+        let id = EndpointId::from_str(code.trim()).with_context(|| {
+            format!(
+                "{:?} isn't a pstream code: ask your friend for the 64-character code \
+                 pstream shows them",
+                code.trim()
+            )
+        })?;
+        if id == own {
+            bail!("that's your own code; ask your friend for theirs");
+        }
+        if let Some(existing) = self.friends.iter().find(|f| f.name == name) {
+            bail!("you already have a friend named {:?}", existing.name);
+        }
+        if let Some(existing) = self.friends.iter().find(|f| f.id().ok() == Some(id)) {
+            bail!("that code is already saved as {:?}", existing.name);
+        }
+        self.friends.push(Friend {
+            name: name.to_string(),
+            code: id.to_string(),
+            auto_open,
+        });
+        Ok(())
+    }
+
+    pub fn remove_friend(&mut self, name: &str) -> Result<()> {
+        let before = self.friends.len();
+        self.friends.retain(|f| f.name != name);
+        if self.friends.len() == before {
+            bail!("no friend named {name:?}");
+        }
+        Ok(())
+    }
+
+    pub fn friend_mut(&mut self, name: &str) -> Result<&mut Friend> {
+        self.friends
+            .iter_mut()
+            .find(|f| f.name == name)
+            .with_context(|| format!("no friend named {name:?}"))
+    }
+
     pub fn friend(&self, name_or_code: &str) -> Option<&Friend> {
         self.friends
             .iter()
