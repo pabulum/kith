@@ -1,0 +1,37 @@
+[package]
+name = "pstream"
+version = "0.1.0"
+edition = "2024"
+description = "Peer-to-peer screen streaming to friends over iroh + Media over QUIC"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.6", features = ["derive", "env"] }
+hex = "0.4"
+# Same feature set iroh-live builds iroh with, so feature unification with
+# iroh-moq's copy doesn't surprise us.
+iroh = { version = "1.2.0", default-features = false, features = ["metrics", "portmapper", "tls-aws-lc-rs"] }
+iroh-moq = { git = "https://github.com/n0-computer/iroh-live", rev = "bd5afc40822eca7e6b1db2432556460ddc345a6d" }
+moq-mux = "0.9.16"
+moq-net = "0.2.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.53", features = ["full"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The moq stack comes from git, pinned to the exact revision iroh-live's
+# Cargo.lock uses (iroh-live bd5afc4 -> moq-dev/moq 6ab7d1a). crates.io's
+# moq-net 0.2.22 predates the API iroh-moq is written against, and moq-tokio
+# isn't published at all, so these patches are load-bearing: deleting them
+# compiles against different crates under the same names. When bumping
+# iroh-moq, read the moq rev out of iroh-live's Cargo.lock and move these
+# together.
+[patch.crates-io]
+hang = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+moq-mux = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+moq-tokio = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
