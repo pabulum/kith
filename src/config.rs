@@ -3,7 +3,6 @@
 use std::{
     fs,
     io::Write,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -16,8 +15,8 @@ use serde::{Deserialize, Serialize};
 /// The directory pstream keeps its state in.
 ///
 /// `--home`/`$PSTREAM_HOME` when given, else `$XDG_CONFIG_HOME/pstream`, else
-/// `~/.config/pstream`. Two homes are two identities, which is how one machine
-/// plays both ends in tests.
+/// `~/.config/pstream` (`%APPDATA%\pstream` on Windows). Two homes are two
+/// identities, which is how one machine plays both ends in tests.
 #[derive(Clone, Debug)]
 pub struct Home(PathBuf);
 
@@ -25,11 +24,7 @@ impl Home {
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
         let dir = match explicit {
             Some(dir) => dir,
-            None => match std::env::var_os("XDG_CONFIG_HOME") {
-                Some(base) if !base.is_empty() => PathBuf::from(base).join("pstream"),
-                _ => PathBuf::from(std::env::var_os("HOME").context("$HOME is not set")?)
-                    .join(".config/pstream"),
-            },
+            None => default_dir()?,
         };
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self(dir))
@@ -39,21 +34,30 @@ impl Home {
         &self.0
     }
 
-    /// The control socket `pstream up` listens on.
+    /// The control socket `pstream up` listens on: a Unix socket, or a named
+    /// pipe on Windows.
     ///
-    /// In `$XDG_RUNTIME_DIR`, named by a hash of the home, because Unix socket
-    /// paths cap at 108 bytes and a home can be arbitrarily deep.
+    /// Named by a hash of the home, because Unix socket paths cap at 108 bytes
+    /// and a home can be arbitrarily deep, and pipe names can't hold a path.
     pub fn socket_path(&self) -> PathBuf {
-        use std::hash::{Hash, Hasher};
+        let name = format!("pstream-{:016x}", self.hash());
+        if cfg!(windows) {
+            return PathBuf::from(format!(r"\\.\pipe\{name}"));
+        }
         match std::env::var_os("XDG_RUNTIME_DIR") {
             Some(runtime) if !runtime.is_empty() => {
-                let home = fs::canonicalize(&self.0).unwrap_or_else(|_| self.0.clone());
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                home.hash(&mut hasher);
-                PathBuf::from(runtime).join(format!("pstream-{:016x}.sock", hasher.finish()))
+                PathBuf::from(runtime).join(format!("{name}.sock"))
             }
             _ => self.0.join("pstream.sock"),
         }
+    }
+
+    fn hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let home = fs::canonicalize(&self.0).unwrap_or_else(|_| self.0.clone());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        home.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn config_path(&self) -> PathBuf {
@@ -71,10 +75,12 @@ impl Home {
                 .with_context(|| format!("{} is not a valid key", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let secret = SecretKey::generate();
-                let mut file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                // Windows keeps %APPDATA% private to the user already.
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+                let mut file = options
                     .open(&path)
                     .with_context(|| format!("creating {}", path.display()))?;
                 file.write_all(hex::encode(secret.to_bytes()).as_bytes())?;
@@ -109,6 +115,21 @@ impl Home {
         fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn default_dir() -> Result<PathBuf> {
+    Ok(match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(base) if !base.is_empty() => PathBuf::from(base).join("pstream"),
+        _ => PathBuf::from(std::env::var_os("HOME").context("$HOME is not set")?)
+            .join(".config/pstream"),
+    })
+}
+
+#[cfg(windows)]
+fn default_dir() -> Result<PathBuf> {
+    let appdata = std::env::var_os("APPDATA").context("%APPDATA% is not set")?;
+    Ok(PathBuf::from(appdata).join("pstream"))
 }
 
 const CONFIG_HEADER: &str = "\

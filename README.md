@@ -8,9 +8,11 @@ concept; the plan lives in [MANIFEST.md](MANIFEST.md).
 ## Needs
 
 - Rust (edition 2024)
-- `mpv` to watch
+- `mpv` to watch (on Windows, `mpv.exe` next to `pstream.exe` or on PATH)
 - `gpu-screen-recorder` to stream your screen (Linux), or `ffmpeg` for `--source test`
 - `notify-send` for "friend is live" notifications (optional)
+
+Windows can watch but can't stream yet. Linux can do both.
 
 ## Use
 
@@ -35,12 +37,13 @@ Without `pstream up` running, `live` and `watch` run in the foreground (Ctrl-C
 stops them). With it running, they hand the request to it.
 
 Settings (player command, capture command, default latency, friends) live in
-`~/.config/pstream/config.toml`. The identity key is `secret.key` next to it;
+`~/.config/pstream/config.toml` (`%APPDATA%\pstream\config.toml` on Windows). The identity key is `secret.key` next to it;
 lose it and friends have to re-add you. `--home <dir>` or `$PSTREAM_HOME` picks
 another state directory, which is how one machine can be several people.
 
 ## Test
 
 ```sh
-scripts/smoke.sh    # three identities on this machine, headless mpv, fake notify-send
+scripts/smoke.sh         # three identities on this machine, headless mpv, fake notify-send
+scripts/wine-smoke.sh    # the Windows build under Wine, watching a Linux stream
 ```

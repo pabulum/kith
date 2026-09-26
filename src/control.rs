@@ -2,17 +2,15 @@
 //!
 //! One identity means one iroh endpoint: a second process binding the same key
 //! would fight the first for its relay slot. So while `up` runs, `live`,
-//! `watch` and `status` hand their request to it over a Unix socket (one JSON
-//! line each way) instead of starting a node of their own.
+//! `watch` and `status` hand their request to it over a Unix socket (a named
+//! pipe on Windows), one JSON line each way, instead of starting a node of
+//! their own.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::warn;
 
 use crate::{
@@ -42,7 +40,7 @@ pub struct Response {
 
 /// Sends a request to the running node. `None` when no node is running.
 pub async fn send(socket: &Path, request: &Request) -> Result<Option<Response>> {
-    let stream = match UnixStream::connect(socket).await {
+    let stream = match transport::connect(socket).await {
         Ok(stream) => stream,
         // A stale socket file from a crashed node refuses; treat it as "not running".
         Err(err)
@@ -55,7 +53,7 @@ pub async fn send(socket: &Path, request: &Request) -> Result<Option<Response>> 
         }
         Err(err) => return Err(err).context("connecting to the pstream node"),
     };
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = tokio::io::split(stream);
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
     write.write_all(line.as_bytes()).await?;
@@ -68,12 +66,10 @@ pub async fn send(socket: &Path, request: &Request) -> Result<Option<Response>> 
 
 /// Serves requests until the process exits.
 pub async fn serve(node: Node, socket: &Path) -> Result<()> {
-    // Only reached after `send` found nothing listening, so a file here is stale.
-    let _ = std::fs::remove_file(socket);
-    let listener =
-        UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
+    let mut listener = transport::Listener::bind(socket)
+        .with_context(|| format!("binding {}", socket.display()))?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = listener.accept().await?;
         let node = node.clone();
         tokio::spawn(async move {
             if let Err(err) = handle(node, stream).await {
@@ -83,8 +79,8 @@ pub async fn serve(node: Node, socket: &Path) -> Result<()> {
     }
 }
 
-async fn handle(node: Node, stream: UnixStream) -> Result<()> {
-    let (read, mut write) = stream.into_split();
+async fn handle(node: Node, stream: impl AsyncRead + AsyncWrite) -> Result<()> {
+    let (read, mut write) = tokio::io::split(stream);
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
     let request: Request = serde_json::from_str(&line)?;
@@ -120,4 +116,94 @@ async fn handle(node: Node, stream: UnixStream) -> Result<()> {
     reply.push('\n');
     write.write_all(reply.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(unix)]
+mod transport {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+    };
+
+    use tokio::net::{UnixListener, UnixStream};
+
+    pub async fn connect(socket: &Path) -> io::Result<UnixStream> {
+        UnixStream::connect(socket).await
+    }
+
+    /// Removes its socket file when dropped, which is when `up` exits.
+    pub struct Listener {
+        listener: UnixListener,
+        path: PathBuf,
+    }
+
+    impl Listener {
+        pub fn bind(socket: &Path) -> io::Result<Self> {
+            // Only reached after `send` found nothing listening, so a file here is stale.
+            let _ = std::fs::remove_file(socket);
+            Ok(Self {
+                listener: UnixListener::bind(socket)?,
+                path: socket.to_owned(),
+            })
+        }
+
+        pub async fn accept(&mut self) -> io::Result<UnixStream> {
+            Ok(self.listener.accept().await?.0)
+        }
+    }
+
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(windows)]
+mod transport {
+    use std::{ffi::OsString, io, path::Path, time::Duration};
+
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
+
+    /// All pipe instances are taken: the server is between accepting one client
+    /// and opening the next instance, so the wait is short.
+    const ERROR_PIPE_BUSY: i32 = 231;
+
+    pub async fn connect(pipe: &Path) -> io::Result<NamedPipeClient> {
+        loop {
+            match ClientOptions::new().open(pipe) {
+                Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {}
+                result => return result,
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A pipe server always holds one unconnected instance for the next client.
+    pub struct Listener {
+        name: OsString,
+        next: NamedPipeServer,
+    }
+
+    impl Listener {
+        pub fn bind(pipe: &Path) -> io::Result<Self> {
+            // `first_pipe_instance` fails if another `up` already serves this
+            // home; pipes vanish with their process, so nothing is ever stale.
+            let next = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(pipe)?;
+            Ok(Self {
+                name: pipe.as_os_str().to_owned(),
+                next,
+            })
+        }
+
+        pub async fn accept(&mut self) -> io::Result<NamedPipeServer> {
+            self.next.connect().await?;
+            let fresh = ServerOptions::new().create(&self.name)?;
+            Ok(std::mem::replace(&mut self.next, fresh))
+        }
+    }
 }

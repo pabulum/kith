@@ -299,7 +299,7 @@ impl Node {
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("starting {program}"))?;
+            .map_err(|err| spawn_error(program, "capture", err))?;
         let stdout = child.stdout.take().expect("stdout is piped");
         Ok((Box::pin(stdout), Some(child)))
     }
@@ -389,7 +389,7 @@ impl Node {
                     .stdin(Stdio::piped())
                     .kill_on_drop(true)
                     .spawn()
-                    .with_context(|| format!("starting the player ({})", argv[0]))?;
+                    .map_err(|err| spawn_error(&argv[0], "player", err))?;
                 output = Box::pin(child.stdin.take().expect("stdin is piped"));
                 player = Some(child);
             }
@@ -743,15 +743,35 @@ fn player_argv(player: &[String], latency: Latency, title: &str) -> Result<Vec<S
         .split_first()
         .context("the player command is empty")?;
     let mut argv = vec![program.clone()];
+    // `file_stem`, so `mpv.exe` and a full path to it count too.
     if Path::new(program)
-        .file_name()
-        .is_some_and(|name| name == "mpv")
+        .file_stem()
+        .is_some_and(|name| name.eq_ignore_ascii_case("mpv"))
     {
         argv.extend(latency.mpv_flags().iter().map(|flag| flag.to_string()));
         argv.push(format!("--title=pstream: {title}"));
     }
     argv.extend(rest.iter().cloned());
     Ok(argv)
+}
+
+/// Says what to do when the capture or player command can't start.
+///
+/// Windows looks for a bare program name next to pstream.exe before PATH, so
+/// a portable folder can carry its own mpv.exe.
+fn spawn_error(program: &str, role: &str, err: std::io::Error) -> anyhow::Error {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        let fix = if cfg!(windows) {
+            "put it next to pstream.exe or on PATH"
+        } else {
+            "install it"
+        };
+        anyhow!(
+            "{program} (the {role} command) isn't installed; {fix}, or set `{role}` in config.toml"
+        )
+    } else {
+        anyhow!("starting {program} (the {role} command): {err}")
+    }
 }
 
 /// Shows a desktop notification with a Watch button; true if it was clicked.

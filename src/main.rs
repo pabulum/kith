@@ -175,12 +175,24 @@ async fn main() -> Result<()> {
 
 /// Ctrl-C, or SIGTERM from systemd or `kill`: both end cleanly, so viewers see
 /// the stream finish rather than fail.
+#[cfg(unix)]
 async fn shutdown_signal() {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("installing a SIGTERM handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+    }
+}
+
+/// Ctrl-C, or the console window closing (Windows allows a few seconds to
+/// finish): both end cleanly, so viewers see the stream finish rather than fail.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    let mut close = tokio::signal::windows::ctrl_close().expect("installing a close handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = close.recv() => {}
     }
 }
 
@@ -210,7 +222,6 @@ async fn up(home: Home) -> Result<()> {
         () = shutdown_signal() => Ok(()),
     };
     node.shutdown().await;
-    let _ = std::fs::remove_file(&socket);
     result
 }
 
