@@ -44,7 +44,7 @@ pub fn run(runtime: Runtime, home: Home) -> Result<()> {
         source: Capture::Screen,
         removing: None,
         was_live: HashSet::new(),
-        player_found: false,
+        browser_fallback: false,
         player_checked: None,
     };
     #[allow(unused_mut)]
@@ -198,7 +198,8 @@ struct App {
     /// Friends who were live at the last refresh, so a newly live one can flag
     /// the window.
     was_live: HashSet<String>,
-    player_found: bool,
+    /// No player is installed, so streams open in the browser.
+    browser_fallback: bool,
     player_checked: Option<Instant>,
 }
 
@@ -228,10 +229,12 @@ impl App {
         let snapshot = node.snapshot();
         self.flag_newly_live(ui.ctx(), &snapshot.friends);
 
-        if !self.player_found() {
+        if self.browser_fallback() {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(RED, "No video player found, so you can't watch yet.");
-                ui.hyperlink_to("Get VLC", player::GET_VLC);
+                ui.label(
+                    RichText::new("Streams open in your browser. A video player lags less:").weak(),
+                );
+                ui.hyperlink_to("get VLC", player::GET_VLC);
             });
             ui.separator();
         }
@@ -466,18 +469,18 @@ impl App {
         });
     }
 
-    /// Whether there's a player to watch with, rechecked every few seconds so
-    /// installing one takes effect without a restart.
-    fn player_found(&mut self) -> bool {
+    /// Whether watching falls back to the browser, rechecked every few seconds
+    /// so installing a player takes effect without a restart.
+    fn browser_fallback(&mut self) -> bool {
         if self
             .player_checked
             .is_none_or(|at| at.elapsed() > PLAYER_RECHECK)
         {
             let setting = self.home.config().map(|config| config.player);
-            self.player_found = setting.is_ok_and(|setting| player::available(&setting));
+            self.browser_fallback = setting.is_ok_and(|setting| player::uses_browser(&setting));
             self.player_checked = Some(Instant::now());
         }
-        self.player_found
+        self.browser_fallback
     }
 
     /// Flashes the taskbar entry when a friend goes live. On Windows, with no

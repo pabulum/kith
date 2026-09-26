@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #eee; font: 15px system-ui, sans-serif; }
+  video { display: block; width: 100%; height: 100%; }
+  #note { position: fixed; top: 1rem; left: 50%; transform: translateX(-50%); padding: .5rem .9rem;
+          border-radius: .4rem; background: rgba(0, 0, 0, .75); cursor: pointer; }
+  #note[hidden] { display: none; }
+  a { color: #8cf; }
+</style>
+</head>
+<body>
+<video id="video" controls autoplay playsinline></video>
+<div id="note" hidden></div>
+<script src="mpegts.js"></script>
+<script>
+  const video = document.getElementById("video");
+  const note = document.getElementById("note");
+  const vlc = '<a href="{get_vlc}" target="_blank" rel="noreferrer">VLC</a>';
+  const say = (html) => { note.innerHTML = html; note.hidden = !html; };
+
+  if (!window.mpegts || !mpegts.getFeatureList().mseLivePlayback) {
+    say(`This browser can't play live video. ${vlc} can.`);
+  } else {
+    const player = mpegts.createPlayer(
+      { type: "mpegts", isLive: true, url: "stream.ts" },
+      // Skip ahead whenever the buffer drifts this far behind live.
+      { liveBufferLatencyChasing: true, liveBufferLatencyMaxLatency: {max_latency},
+        liveBufferLatencyMinRemain: 0.3 },
+    );
+    player.on(mpegts.Events.ERROR, (type, detail, info) => {
+      const why = (info && info.msg) || detail || type;
+      say(`Can't play this stream here (${why}). ${vlc} can.`);
+    });
+    player.attachMediaElement(video);
+    player.load();
+    // Browsers only allow sound after a click on the page: start muted when
+    // they refuse, and unmute on the first click.
+    video.play().catch((err) => {
+      if (err.name !== "NotAllowedError") return;
+      video.muted = true;
+      video.play();
+      say("Click for sound");
+      document.body.addEventListener("click", () => { video.muted = false; say(""); },
+                                     { once: true });
+    });
+  }
+</script>
+</body>
+</html>

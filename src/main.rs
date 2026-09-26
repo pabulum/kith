@@ -1,6 +1,6 @@
 //! pstream: stream your screen to friends, peer to peer.
 //!
-//! See MANIFEST.md for where this is going and README.md for how to use it.
+//! See README.md for how to use it.
 
 // Release builds on Windows are GUI programs, so double-clicking one opens no
 // console window. `attach_console` gives subcommands their terminal back.

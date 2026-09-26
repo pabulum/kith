@@ -2,7 +2,8 @@
 //!
 //! mpv reads MPEG-TS on stdin. VLC is handed a local HTTP URL instead, because
 //! on Windows it can't read stdin. A custom command gets that URL wherever an
-//! argument says `{url}`, and stdin otherwise.
+//! argument says `{url}`, and stdin otherwise. With neither player installed,
+//! the stream opens in the browser, in a page pstream serves locally.
 
 use std::{
     env,
@@ -18,7 +19,8 @@ use crate::config::Latency;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PlayerSetting {
-    /// `"auto"` (mpv if it's installed, else VLC), `"mpv"` or `"vlc"`.
+    /// `"auto"` (mpv, else VLC, else the browser), `"mpv"`, `"vlc"` or
+    /// `"browser"`.
     Named(String),
     /// A command, which gets a URL wherever an argument says `{url}` and the
     /// stream on stdin otherwise.
@@ -38,8 +40,12 @@ pub enum Player {
     Stdin(Vec<String>),
     /// The command opens a local URL, put in place of `{url}`.
     Url(Vec<String>),
+    /// The default browser opens a local page that plays the stream.
+    Browser(Latency),
 }
 
+// The app and the browser page link to it; neither exists on Android.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub const GET_VLC: &str = "https://www.videolan.org/vlc/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,21 +56,34 @@ enum Kind {
 
 /// Picks the player for watching `title`.
 ///
-/// `$PSTREAM_PLAYER` (split on whitespace) overrides config.toml, which is how
-/// the smoke test swaps in a headless mpv.
+/// `$PSTREAM_PLAYER` overrides config.toml: one of the names, or a command
+/// split on whitespace. That's how the smoke tests swap in a headless mpv.
 pub fn resolve(setting: &PlayerSetting, latency: Latency, title: &str) -> Result<Player> {
     let setting = match env::var("PSTREAM_PLAYER") {
-        Ok(env) if !env.trim().is_empty() => {
-            PlayerSetting::Command(env.split_whitespace().map(String::from).collect())
-        }
+        Ok(env) if !env.trim().is_empty() => from_env(&env),
         _ => setting.clone(),
     };
     resolve_with(&setting, latency, title, &find)
 }
 
-/// True when [`resolve`] would find something to play with.
-pub fn available(setting: &PlayerSetting) -> bool {
-    resolve(setting, Latency::default(), "").is_ok()
+fn from_env(env: &str) -> PlayerSetting {
+    let words: Vec<String> = env.split_whitespace().map(String::from).collect();
+    match words.as_slice() {
+        [name] if ["auto", "mpv", "vlc", "browser"].contains(&name.as_str()) => {
+            PlayerSetting::Named(name.clone())
+        }
+        _ => PlayerSetting::Command(words),
+    }
+}
+
+/// True when watching would fall back to the browser, which works but lags
+/// a real player.
+#[cfg_attr(target_os = "android", allow(dead_code))]
+pub fn uses_browser(setting: &PlayerSetting) -> bool {
+    matches!(
+        resolve(setting, Latency::default(), ""),
+        Ok(Player::Browser(_))
+    )
 }
 
 fn resolve_with(
@@ -79,11 +98,13 @@ fn resolve_with(
             "auto" => match (find(Kind::Mpv), find(Kind::Vlc)) {
                 (Some(mpv), _) => Ok(mpv_player(&mpv, latency, title, &default_mpv)),
                 (None, Some(vlc)) => Ok(vlc_player(&vlc, latency, title)),
-                (None, None) => bail!(
-                    "no video player found: install VLC ({GET_VLC}) or mpv, or set `player` \
-                     in config.toml"
+                (None, None) if cfg!(target_os = "android") => bail!(
+                    "no video player found: use `pstream watch --serve 127.0.0.1:8080` and \
+                     open that URL in a player app"
                 ),
+                (None, None) => Ok(Player::Browser(latency)),
             },
+            "browser" => Ok(Player::Browser(latency)),
             "mpv" => {
                 let mpv = find(Kind::Mpv).unwrap_or_else(|| "mpv".into());
                 Ok(mpv_player(&mpv, latency, title, &default_mpv))
@@ -93,8 +114,8 @@ fn resolve_with(
                 Ok(vlc_player(&vlc, latency, title))
             }
             other => bail!(
-                "config.toml has player = {other:?}: use \"auto\", \"mpv\", \"vlc\", or a \
-                 command such as [\"mpv\", \"-\"]"
+                "config.toml has player = {other:?}: use \"auto\", \"mpv\", \"vlc\", \
+                 \"browser\", or a command such as [\"mpv\", \"-\"]"
             ),
         },
         PlayerSetting::Command(argv) => {
@@ -229,9 +250,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_with_nothing_installed_says_what_to_get() {
-        let err = auto(&[]).unwrap_err().to_string();
-        assert!(err.contains(GET_VLC), "{err}");
+    fn auto_with_nothing_installed_uses_the_browser() {
+        assert_eq!(auto(&[]).unwrap(), Player::Browser(Latency::Normal));
     }
 
     #[test]
@@ -262,6 +282,15 @@ mod tests {
                 "--force-window=immediate",
                 "-"
             ]
+        );
+    }
+
+    #[test]
+    fn the_environment_takes_names_and_commands() {
+        assert_eq!(from_env("vlc"), PlayerSetting::Named("vlc".into()));
+        assert_eq!(
+            from_env("mpv --vo=null -"),
+            PlayerSetting::Command(vec!["mpv".into(), "--vo=null".into(), "-".into()])
         );
     }
 

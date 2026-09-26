@@ -405,6 +405,12 @@ impl Node {
                     output = Box::pin(stream);
                     player = Some(child);
                 }
+                #[cfg(not(target_os = "android"))]
+                Player::Browser(latency) => {
+                    output = Box::pin(open_in_browser(&name, latency).await?)
+                }
+                #[cfg(target_os = "android")]
+                Player::Browser(_) => bail!("there's no browser to hand the stream to here"),
             },
             Sink::Serve(addr) => output = Box::pin(serve_one(addr).await?),
         }
@@ -644,8 +650,9 @@ impl Node {
             } else {
                 ""
             };
+            let watching = if state.watching { ", watching" } else { "" };
             out.push_str(&format!(
-                "  {:<16} {presence:<8}{path}{auto}\n",
+                "  {:<16} {presence:<8}{path}{watching}{auto}\n",
                 state.friend.name
             ));
         }
@@ -810,37 +817,140 @@ async fn open_url_player(argv: &[String]) -> Result<(Child, TcpStream)> {
 }
 
 /// Accepts HTTP clients until one asks for `path` (anything, when `None`),
-/// and answers it with an endless MPEG-TS body. Headers are read and ignored:
-/// there's only one thing to serve.
+/// and answers it with an endless MPEG-TS body.
 async fn accept_http(listener: &TcpListener, path: Option<&str>) -> Result<TcpStream> {
     loop {
         let (stream, client) = listener.accept().await.context("accepting the player")?;
-        let mut stream = BufReader::new(stream);
-        let mut request = String::new();
-        let mut line = String::new();
-        stream.read_line(&mut request).await?;
-        loop {
-            line.clear();
-            if stream.read_line(&mut line).await? == 0 || line.trim().is_empty() {
-                break;
-            }
-        }
-        let mut stream = stream.into_inner();
-        if path.is_some_and(|path| request.split_whitespace().nth(1) != Some(path)) {
-            debug!(%client, "refused {:?}", request.trim());
-            let _ = stream
-                .write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                .await;
+        let (requested, mut stream) = read_request(stream).await?;
+        if path.is_some_and(|path| requested != path) {
+            debug!(%client, "refused {requested:?}");
+            let _ = stream.write_all(NOT_FOUND).await;
             continue;
         }
         debug!(%client, "player connected");
-        stream
-            .write_all(
-                b"HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\n\r\n",
-            )
-            .await?;
+        stream.write_all(STREAM_HEADER).await?;
         return Ok(stream);
     }
+}
+
+const STREAM_HEADER: &[u8] =
+    b"HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\n\r\n";
+const NOT_FOUND: &[u8] = b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+/// Reads one HTTP request and returns its path. Headers are read and ignored:
+/// there's only one kind of thing to serve.
+async fn read_request(stream: TcpStream) -> std::io::Result<(String, TcpStream)> {
+    let mut stream = BufReader::new(stream);
+    let mut request = String::new();
+    let mut line = String::new();
+    stream.read_line(&mut request).await?;
+    loop {
+        line.clear();
+        if stream.read_line(&mut line).await? == 0 || line.trim().is_empty() {
+            break;
+        }
+    }
+    let path = request.split_whitespace().nth(1).unwrap_or_default();
+    Ok((path.to_string(), stream.into_inner()))
+}
+
+/// Plays the stream in the default browser, through a page served on
+/// 127.0.0.1 that hands it to the browser's own video element with mpegts.js.
+/// There's no player process to watch, so the tab closing shows up as the
+/// connection breaking.
+#[cfg(not(target_os = "android"))]
+async fn open_in_browser(title: &str, latency: Latency) -> Result<TcpStream> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .context("listening for the browser")?;
+    // Unguessable, like the players' URLs, and every file lives under it.
+    let base = format!("/{:016x}/", random_u64());
+    let url = format!("http://{}{base}", listener.local_addr()?);
+    let page = Arc::new(watch_page(title, latency));
+    let (found, mut stream) = tokio::sync::mpsc::channel(1);
+    // A task per connection: browsers open connections they don't send on
+    // right away, and those mustn't hold up the stream's.
+    let server = tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(serve_browser(
+                socket,
+                base.clone(),
+                page.clone(),
+                found.clone(),
+            ));
+        }
+    });
+    let opening = url.clone();
+    tokio::task::spawn_blocking(move || webbrowser::open(&opening))
+        .await?
+        .with_context(|| format!("opening {url} in the browser"))?;
+    let stream = tokio::time::timeout(PLAYER_TIMEOUT, stream.recv()).await;
+    server.abort();
+    match stream {
+        Ok(Some(stream)) => Ok(stream),
+        _ => bail!(
+            "the browser didn't open the stream within {} s ({url})",
+            PLAYER_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+/// Answers one browser request: the page, mpegts.js, or the stream itself,
+/// which goes back to [`open_in_browser`].
+#[cfg(not(target_os = "android"))]
+async fn serve_browser(
+    socket: TcpStream,
+    base: String,
+    page: Arc<String>,
+    found: tokio::sync::mpsc::Sender<TcpStream>,
+) {
+    const MPEGTS_JS: &[u8] = include_bytes!("../assets/mpegts.js/mpegts.js");
+    let Ok(Ok((path, mut socket))) =
+        tokio::time::timeout(Duration::from_secs(10), read_request(socket)).await
+    else {
+        return;
+    };
+    let (kind, body): (&str, &[u8]) = match path.strip_prefix(base.as_str()) {
+        Some("") => ("text/html; charset=utf-8", page.as_bytes()),
+        Some("mpegts.js") => ("text/javascript", MPEGTS_JS),
+        Some("stream.ts") => {
+            if socket.write_all(STREAM_HEADER).await.is_ok() {
+                let _ = found.send(socket).await;
+            }
+            return;
+        }
+        _ => {
+            let _ = socket.write_all(NOT_FOUND).await;
+            return;
+        }
+    };
+    let head = format!(
+        "HTTP/1.0 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\n\r\n",
+        body.len()
+    );
+    if socket.write_all(head.as_bytes()).await.is_ok() {
+        let _ = socket.write_all(body).await;
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn watch_page(title: &str, latency: Latency) -> String {
+    // How far behind live the page lets playback drift before skipping ahead.
+    let max_latency = match latency {
+        Latency::Low => "0.8",
+        Latency::Normal => "1.5",
+        Latency::Smooth => "4",
+    };
+    let title = format!("pstream: {title}")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    include_str!("../assets/watch.html")
+        .replace("{title}", &title)
+        .replace("{max_latency}", max_latency)
+        .replace("{get_vlc}", player::GET_VLC)
 }
 
 /// 64 random bits without a dependency: std seeds every `RandomState` from the

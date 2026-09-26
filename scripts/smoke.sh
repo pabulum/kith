@@ -198,6 +198,32 @@ if PSTREAM_PLAYER="ffmpeg -v error -i {url} -t 3 -c copy -f mpegts $T/url.ts" \
 else
     fail "{url} player (see $T/bob-url.log)"
 fi
+# 9. The browser fallback: a fake browser fetches what a real one would, the
+#    page, mpegts.js and a stray favicon, then records 3 s of the stream.
+cat >"$T/bin/fake-browser" <<EOF
+#!/bin/sh
+{
+    curl -sf "\$1" >"$T/page.html"
+    curl -sf "\$1mpegts.js" >"$T/mpegts.js"
+    curl -s -o /dev/null -w '%{http_code}' "\$1../favicon.ico" >"$T/favicon.status"
+    curl -s --max-time 3 "\$1stream.ts" >"$T/browser.ts"
+} >/dev/null 2>&1 &
+EOF
+chmod +x "$T/bin/fake-browser"
+if PSTREAM_PLAYER=browser BROWSER="$T/bin/fake-browser" \
+    timeout 30 "$PSTREAM" --home "$T/bob" watch alice 2>"$T/bob-browser.log" \
+    && grep -q 'player closed' "$T/bob-browser.log"; then
+    n=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$T/browser.ts" 2>/dev/null | head -1)
+    js=$(wc -c <"$T/mpegts.js")
+    if [[ ${n:-0} -gt 30 && $js -gt 100000 && $(cat "$T/favicon.status") == 404 ]] \
+        && grep -q 'src="mpegts.js"' "$T/page.html"; then
+        pass "browser fallback served the page, mpegts.js ($js bytes) and $n frames"
+    else
+        fail "browser fallback: frames=${n:-none} js=$js favicon=$(cat "$T/favicon.status") (see $T/bob-browser.log)"
+    fi
+else
+    fail "browser fallback (see $T/bob-browser.log)"
+fi
 pst alice live --stop >/dev/null
 
 if ((FAILED)); then

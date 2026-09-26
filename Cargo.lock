@@ -4874,6 +4874,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webbrowser",
  "windows-sys 0.61.2",
 ]
 
