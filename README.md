@@ -8,7 +8,8 @@ concept; the plan lives in [MANIFEST.md](MANIFEST.md).
 ## Needs
 
 - Rust (edition 2024)
-- `mpv` to watch (on Windows, `mpv.exe` next to `pstream.exe` or on PATH)
+- `mpv` or VLC to watch. pstream uses mpv if it finds it (lower latency) and
+  VLC otherwise, including VLC's usual install folder on Windows.
 - `gpu-screen-recorder` to stream your screen (Linux), or `ffmpeg` for `--source test`
 - `notify-send` for "friend is live" notifications (optional)
 
@@ -29,7 +30,7 @@ alias pstream=./target/release/pstream
 pstream                                  # the window
 pstream id                               # your code; send it to your friend
 pstream friend add sam <sam's code>      # they add yours too, or neither side connects
-pstream friend set sam --auto-open       # open mpv when sam goes live instead of notifying
+pstream friend set sam --auto-open       # open the player when sam goes live instead of notifying
 
 pstream up                               # stay reachable (leave it running)
 pstream live                             # stream your screen (portal picker the first time)
@@ -52,6 +53,7 @@ directory, which is how one machine can be several people.
 ## Test
 
 ```sh
+cargo test               # unit tests (player choice)
 scripts/smoke.sh         # three identities on this machine, headless mpv, fake notify-send
 scripts/wine-smoke.sh    # the Windows build under Wine, watching a Linux stream
 ```

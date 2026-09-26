@@ -183,6 +183,21 @@ else
     fail "--serve never listened (see $T/bob-serve.log)"
 fi
 wait "$BOB_SERVE" 2>/dev/null
+
+# 8. A player command with {url} (how VLC is run) gets a one-time local URL
+#    instead of stdin. ffmpeg stands in, recording 3 s of what it's served.
+if PSTREAM_PLAYER="ffmpeg -v error -i {url} -t 3 -c copy -f mpegts $T/url.ts" \
+    timeout 30 "$PSTREAM" --home "$T/bob" watch alice 2>"$T/bob-url.log" \
+    && grep -q 'player closed' "$T/bob-url.log"; then
+    n=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$T/url.ts" 2>/dev/null | head -1)
+    if [[ ${n:-0} -gt 60 ]]; then
+        pass "a {url} player got $n frames from its one-time URL"
+    else
+        fail "{url} player: frames=${n:-none} (see $T/bob-url.log)"
+    fi
+else
+    fail "{url} player (see $T/bob-url.log)"
+fi
 pst alice live --stop >/dev/null
 
 if ((FAILED)); then

@@ -7,7 +7,7 @@
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -18,11 +18,14 @@ use crate::{
     config::{Config, Home},
     control::{self, Request},
     node::{Capture, FriendState, Node, Presence, Role, Sink},
+    player,
 };
 
 /// How often the window re-reads the node's state. A snapshot is a few mutex
 /// reads, so polling is simpler than wiring events through.
 const REFRESH: Duration = Duration::from_millis(500);
+/// How often the window looks for a newly installed player.
+const PLAYER_RECHECK: Duration = Duration::from_secs(5);
 
 const RED: Color32 = Color32::from_rgb(0xe0, 0x40, 0x40);
 const GREEN: Color32 = Color32::from_rgb(0x40, 0xb0, 0x60);
@@ -41,6 +44,8 @@ pub fn run(runtime: Runtime, home: Home) -> Result<()> {
         source: Capture::Screen,
         removing: None,
         was_live: HashSet::new(),
+        player_found: false,
+        player_checked: None,
     };
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
@@ -120,6 +125,8 @@ struct Inner {
     node: NodeState,
     /// The latest thing to tell the user.
     message: Option<Message>,
+    /// Friends whose Watch was clicked and whose player isn't up yet.
+    opening: HashSet<String>,
 }
 
 #[derive(Clone, Default)]
@@ -161,6 +168,20 @@ impl Shared {
     fn message(&self) -> Option<Message> {
         self.0.lock().unwrap().message.clone()
     }
+
+    fn is_opening(&self, name: &str) -> bool {
+        self.0.lock().unwrap().opening.contains(name)
+    }
+
+    /// Marks `name` as opening or not; true if that changed anything.
+    fn opening(&self, name: &str, opening: bool) -> bool {
+        let set = &mut self.0.lock().unwrap().opening;
+        if opening {
+            set.insert(name.to_string())
+        } else {
+            set.remove(name)
+        }
+    }
 }
 
 struct App {
@@ -177,6 +198,8 @@ struct App {
     /// Friends who were live at the last refresh, so a newly live one can flag
     /// the window.
     was_live: HashSet<String>,
+    player_found: bool,
+    player_checked: Option<Instant>,
 }
 
 impl eframe::App for App {
@@ -204,6 +227,14 @@ impl App {
     fn main(&mut self, ui: &mut egui::Ui, node: &Node) {
         let snapshot = node.snapshot();
         self.flag_newly_live(ui.ctx(), &snapshot.friends);
+
+        if !self.player_found() {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(RED, "No video player found, so you can't watch yet.");
+                ui.hyperlink_to("Get VLC", player::GET_VLC);
+            });
+            ui.separator();
+        }
 
         ui.heading("Your code");
         ui.label(
@@ -296,13 +327,38 @@ impl App {
             "direct: peer to peer. relayed: through a public relay server, \
              which can cap the quality.",
         );
-        // Its own column, so the settings after it line up whether or not it's there.
-        if state.presence != Presence::Live {
-            ui.label("");
-        } else if state.watching {
+        // On every row, so opening a stream never hinges on presence being
+        // right: like `pstream watch`, the button just tries.
+        if state.watching {
+            if self.shared.opening(name, false) {
+                self.shared.say(Message::Info(format!(
+                    "Watching {name}. Close the player to stop."
+                )));
+            }
             ui.label("watching");
-        } else if ui.button("Watch").clicked() {
-            self.watch(node, name.clone());
+        } else if self.shared.is_opening(name) {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("opening…");
+            });
+        } else {
+            let (label, hover) = match state.presence {
+                Presence::Live => (
+                    RichText::new("Watch").strong(),
+                    format!("Open {name}'s stream"),
+                ),
+                Presence::Online => (
+                    RichText::new("Watch"),
+                    format!("{name} doesn't seem to be live, but this checks anyway"),
+                ),
+                Presence::Offline => (
+                    RichText::new("Watch"),
+                    format!("{name} seems to be offline, but this tries anyway"),
+                ),
+            };
+            if ui.button(label).on_hover_text(hover).clicked() {
+                self.watch(node, name.clone());
+            }
         }
         ui.horizontal(|ui| {
             let mut auto_open = state.friend.auto_open;
@@ -396,13 +452,32 @@ impl App {
     }
 
     fn watch(&self, node: &Node, name: String) {
+        self.shared.opening(&name, true);
+        self.shared
+            .say(Message::Info(format!("Opening {name}'s stream…")));
         let node = node.clone();
         let shared = self.shared.clone();
         self.runtime.spawn(async move {
-            if let Err(err) = node.watch(&name, None, Sink::Player).await {
+            let watched = node.watch(&name, None, Sink::Player).await;
+            shared.opening(&name, false);
+            if let Err(err) = watched {
                 shared.say(Message::Problem(format!("Watching {name}: {err:#}")));
             }
         });
+    }
+
+    /// Whether there's a player to watch with, rechecked every few seconds so
+    /// installing one takes effect without a restart.
+    fn player_found(&mut self) -> bool {
+        if self
+            .player_checked
+            .is_none_or(|at| at.elapsed() > PLAYER_RECHECK)
+        {
+            let setting = self.home.config().map(|config| config.player);
+            self.player_found = setting.is_ok_and(|setting| player::available(&setting));
+            self.player_checked = Some(Instant::now());
+        }
+        self.player_found
     }
 
     /// Flashes the taskbar entry when a friend goes live. On Windows, with no

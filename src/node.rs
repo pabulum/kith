@@ -9,8 +9,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
-    path::{Path, PathBuf},
+    net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex, RwLock},
@@ -29,20 +29,25 @@ use moq_mux::import::{ContainerFormat, ContainerStream};
 use moq_net::announce::{Kind as AnnounceKind, Update as AnnounceUpdate};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     process::{Child, Command},
     sync::oneshot,
     task::JoinHandle,
 };
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, Friend, Home, Latency};
+use crate::{
+    config::{Config, Friend, Home, Latency},
+    player::{self, Player},
+};
 
 const LIVE_PREFIX: &str = "live/";
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `watch` waits for a friend's broadcast to be announced.
 const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a player handed a URL gets to open it.
+const PLAYER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Offline friends are retried this often, so a friend who comes online hears
 /// about a stream that's already running.
 const REDIAL_INTERVAL: Duration = Duration::from_secs(30);
@@ -384,17 +389,23 @@ impl Node {
                         .with_context(|| format!("creating {}", file.display()))?,
                 );
             }
-            Sink::Player => {
-                let argv = player_argv(&self.config().player, latency, &name)?;
-                let mut child = Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .stdin(Stdio::piped())
-                    .kill_on_drop(true)
-                    .spawn()
-                    .map_err(|err| spawn_error(&argv[0], "player", err))?;
-                output = Box::pin(child.stdin.take().expect("stdin is piped"));
-                player = Some(child);
-            }
+            Sink::Player => match player::resolve(&self.config().player, latency, &name)? {
+                Player::Stdin(argv) => {
+                    let mut child = Command::new(&argv[0])
+                        .args(&argv[1..])
+                        .stdin(Stdio::piped())
+                        .kill_on_drop(true)
+                        .spawn()
+                        .map_err(|err| spawn_error(&argv[0], "player", err))?;
+                    output = Box::pin(child.stdin.take().expect("stdin is piped"));
+                    player = Some(child);
+                }
+                Player::Url(argv) => {
+                    let (child, stream) = open_url_player(&argv).await?;
+                    output = Box::pin(stream);
+                    player = Some(child);
+                }
+            },
             Sink::Serve(addr) => output = Box::pin(serve_one(addr).await?),
         }
 
@@ -756,32 +767,89 @@ impl Drop for Watching {
     }
 }
 
-/// Waits for one HTTP client on `addr` and answers it with an endless MPEG-TS body.
+/// Waits for one HTTP client on `addr`, for `watch --serve`.
 ///
 /// HTTP rather than raw TCP because it's what Android players open from a URL.
-/// The request is read and ignored: there is only one thing to serve.
-async fn serve_one(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+async fn serve_one(addr: SocketAddr) -> Result<TcpStream> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("listening on {addr}"))?;
     info!("open http://{addr}/ in mpv or VLC to watch");
-    let (stream, client) = listener.accept().await.context("accepting the player")?;
-    debug!(%client, "player connected");
-    let mut stream = BufReader::new(stream);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if stream.read_line(&mut line).await? == 0 || line.trim().is_empty() {
-            break;
+    accept_http(&listener, None).await
+}
+
+/// Starts a player on a one-time local URL and waits for it to connect.
+async fn open_url_player(argv: &[String]) -> Result<(Child, TcpStream)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .context("listening for the player")?;
+    // Unguessable, so nothing else on this machine that connects first gets
+    // the stream. `.ts` tells the player what's coming.
+    let path = format!("/{:016x}.ts", random_u64());
+    let url = format!("http://{}{path}", listener.local_addr()?);
+    let argv: Vec<String> = argv.iter().map(|arg| arg.replace("{url}", &url)).collect();
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|err| spawn_error(&argv[0], "player", err))?;
+    let stream = tokio::select! {
+        stream = accept_http(&listener, Some(&path)) => stream?,
+        status = child.wait() => {
+            bail!("the player ({}) quit before opening the stream ({})", argv[0], status?)
         }
+        // Generous: VLC on Windows asks a privacy question on its first run.
+        () = tokio::time::sleep(PLAYER_TIMEOUT) => bail!(
+            "the player ({}) didn't open the stream within {} s",
+            argv[0],
+            PLAYER_TIMEOUT.as_secs()
+        ),
+    };
+    Ok((child, stream))
+}
+
+/// Accepts HTTP clients until one asks for `path` (anything, when `None`),
+/// and answers it with an endless MPEG-TS body. Headers are read and ignored:
+/// there's only one thing to serve.
+async fn accept_http(listener: &TcpListener, path: Option<&str>) -> Result<TcpStream> {
+    loop {
+        let (stream, client) = listener.accept().await.context("accepting the player")?;
+        let mut stream = BufReader::new(stream);
+        let mut request = String::new();
+        let mut line = String::new();
+        stream.read_line(&mut request).await?;
+        loop {
+            line.clear();
+            if stream.read_line(&mut line).await? == 0 || line.trim().is_empty() {
+                break;
+            }
+        }
+        let mut stream = stream.into_inner();
+        if path.is_some_and(|path| request.split_whitespace().nth(1) != Some(path)) {
+            debug!(%client, "refused {:?}", request.trim());
+            let _ = stream
+                .write_all(b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            continue;
+        }
+        debug!(%client, "player connected");
+        stream
+            .write_all(
+                b"HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\n\r\n",
+            )
+            .await?;
+        return Ok(stream);
     }
-    let mut stream = stream.into_inner();
-    stream
-        .write_all(
-            b"HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\n\r\n",
-        )
-        .await?;
-    Ok(stream)
+}
+
+/// 64 random bits without a dependency: std seeds every `RandomState` from the
+/// OS's randomness.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
 }
 
 async fn wait_for(child: &mut Option<Child>) -> std::io::Result<std::process::ExitStatus> {
@@ -789,31 +857,6 @@ async fn wait_for(child: &mut Option<Child>) -> std::io::Result<std::process::Ex
         Some(child) => child.wait().await,
         None => std::future::pending().await,
     }
-}
-
-/// The player command, with latency flags and a title when it's mpv.
-///
-/// `$PSTREAM_PLAYER` (split on whitespace) overrides config.toml, which is how
-/// the smoke test swaps in a headless mpv.
-fn player_argv(player: &[String], latency: Latency, title: &str) -> Result<Vec<String>> {
-    let player: Vec<String> = match std::env::var("PSTREAM_PLAYER") {
-        Ok(env) if !env.trim().is_empty() => env.split_whitespace().map(String::from).collect(),
-        _ => player.to_vec(),
-    };
-    let (program, rest) = player
-        .split_first()
-        .context("the player command is empty")?;
-    let mut argv = vec![program.clone()];
-    // `file_stem`, so `mpv.exe` and a full path to it count too.
-    if Path::new(program)
-        .file_stem()
-        .is_some_and(|name| name.eq_ignore_ascii_case("mpv"))
-    {
-        argv.extend(latency.mpv_flags().iter().map(|flag| flag.to_string()));
-        argv.push(format!("--title=pstream: {title}"));
-    }
-    argv.extend(rest.iter().cloned());
-    Ok(argv)
 }
 
 /// Says what to do when the capture or player command can't start.

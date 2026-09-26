@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
+use crate::player::PlayerSetting;
+
 /// The directory pstream keeps its state in.
 ///
 /// `--home`/`$PSTREAM_HOME` when given, else `$XDG_CONFIG_HOME/pstream`, else
@@ -135,14 +137,16 @@ fn default_dir() -> Result<PathBuf> {
 const CONFIG_HEADER: &str = "\
 # pstream settings. `pstream friend ...` rewrites this file; comments you add are not kept.
 #
-# player:  receives the stream as MPEG-TS on stdin.
+# player:  \"auto\" (mpv if it's installed, else VLC), \"mpv\", \"vlc\", or a command.
+#          A command gets the stream on stdin, or a local URL wherever an
+#          argument says {url}, e.g. [\"vlc\", \"{url}\"].
 # capture: writes MPEG-TS (H.264/H.265 video, AAC audio) to stdout for `pstream live`.
 # latency: default for watching: low | normal | smooth.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    pub player: Vec<String>,
+    pub player: PlayerSetting,
     pub capture: Vec<String>,
     pub latency: Latency,
     #[serde(rename = "friend")]
@@ -152,9 +156,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            player: ["mpv", "--force-window=immediate", "-"]
-                .map(String::from)
-                .to_vec(),
+            player: PlayerSetting::default(),
             capture: DEFAULT_CAPTURE.map(String::from).to_vec(),
             latency: Latency::Normal,
             friends: Vec::new(),
@@ -289,12 +291,12 @@ impl Friend {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Latency {
-    /// Skip ahead after 100 ms of stall and tell mpv not to buffer.
+    /// Skip ahead after 100 ms of stall, and have the player barely buffer.
     Low,
-    /// Skip after 500 ms; mpv's low-latency profile.
+    /// Skip after 500 ms, with a low-latency player setup.
     #[default]
     Normal,
-    /// Ride out 2 s of stall and let mpv buffer normally.
+    /// Ride out 2 s of stall, and let the player buffer normally.
     Smooth,
 }
 
@@ -305,14 +307,6 @@ impl Latency {
             Self::Low => Duration::from_millis(100),
             Self::Normal => Duration::from_millis(500),
             Self::Smooth => Duration::from_secs(2),
-        }
-    }
-
-    pub fn mpv_flags(self) -> &'static [&'static str] {
-        match self {
-            Self::Low => &["--profile=low-latency", "--cache=no"],
-            Self::Normal => &["--profile=low-latency"],
-            Self::Smooth => &[],
         }
     }
 }

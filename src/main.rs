@@ -11,6 +11,7 @@ mod control;
 #[cfg(not(target_os = "android"))]
 mod gui;
 mod node;
+mod player;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Mutex};
 
