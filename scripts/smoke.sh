@@ -6,8 +6,9 @@
 # outputs and a fake notify-send stands in for the desktop notification.
 # Holepunching between two processes on one host is trivial, so this proves
 # the plumbing (identity, friend gate, MoQ announce/subscribe, TS import and
-# export, the control socket, auto-open and notification paths), not NAT
-# traversal. Usage: scripts/smoke.sh [path/to/pstream]
+# export, the control socket and handoff to `up`, auto-open and notification
+# paths, the HTTP sink), not NAT traversal.
+# Usage: scripts/smoke.sh [path/to/pstream]
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -108,6 +109,7 @@ chmod +x "$T/bin/notify-send"
 pst bob friend set alice --no-auto-open >/dev/null
 PATH="$T/bin:$PATH" "$PSTREAM" --home "$T/bob" up >"$T/bob-up2.out" 2>"$T/bob-up2.log" &
 PIDS+=($!)
+BOB_UP=$!
 wait_for "$T/bob-up2.out" 'pstream is up' 10 || fail "bob's node didn't restart"
 start_alice notify
 if wait_for "$T/bob-up2.log" 'player closed' 30 && grep -q 'alice is live' "$T/notified"; then
@@ -128,6 +130,60 @@ else
 fi
 grep -q "refused a connection" "$T/alice-notify.log" && pass "alice logged the refusal" || fail "alice didn't log refusing carol ($C)"
 stop_alice
+
+# 6. alice runs `up` too, so `live` and `live --stop` are handed to her node
+#    over the control socket. bob's node from check 4 is still watching for her.
+"$PSTREAM" --home "$T/alice" up >"$T/alice-up.out" 2>"$T/alice-up.log" &
+PIDS+=($!)
+wait_for "$T/alice-up.out" 'pstream is up' 10 || fail "alice's node didn't start"
+handoff=$(pst alice live --source test 2>&1)
+if [[ $handoff == live* ]] && wait_for "$T/alice-up.log" 'live as' 10; then
+    pass "live handed off to alice's running node"
+else
+    fail "handoff: $handoff (see $T/alice-up.log)"
+fi
+# Waits up to $1 seconds for bob's status to match the glob $2.
+bob_status_matches() {
+    local deadline=$((SECONDS + $1))
+    until [[ $(pst bob status 2>&1) == $2 ]]; do
+        ((SECONDS < deadline)) || return 1
+        sleep 0.5
+    done
+}
+if bob_status_matches 15 '*alice*LIVE*direct,*ms*'; then
+    pass "bob's status shows alice LIVE over a direct path"
+else
+    fail "status path: $(pst bob status 2>&1)"
+fi
+stopped=$(pst alice live --stop 2>&1)
+if [[ $stopped == stopped ]] && bob_status_matches 10 '*alice*online*'; then
+    pass "live --stop through the control socket ended the stream for bob"
+else
+    fail "stop: $stopped / $(pst bob status 2>&1)"
+fi
+
+# 7. --serve hands the stream to one HTTP player. It needs bob's own node, so
+#    his `up` goes first.
+kill -TERM "$BOB_UP"; wait "$BOB_UP" 2>/dev/null
+pst alice live --source test >/dev/null
+PORT=$((20000 + RANDOM % 20000))
+"$PSTREAM" --home "$T/bob" watch alice --serve "127.0.0.1:$PORT" 2>"$T/bob-serve.log" &
+PIDS+=($!)
+BOB_SERVE=$!
+if wait_for "$T/bob-serve.log" 'open http' 20; then
+    timeout 20 ffmpeg -v error -i "http://127.0.0.1:$PORT/" -t 3 -c copy -f mpegts "$T/served.ts"
+    served=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$T/served.ts" 2>/dev/null | head -1)
+    # The client leaving is the player closing, so bob's watch ends by itself.
+    if [[ ${served:-0} -gt 60 ]] && wait_for "$T/bob-serve.log" 'player closed' 10; then
+        pass "--serve streamed $served frames to an HTTP client"
+    else
+        fail "--serve: frames=${served:-none} (see $T/bob-serve.log)"
+    fi
+else
+    fail "--serve never listened (see $T/bob-serve.log)"
+fi
+wait "$BOB_SERVE" 2>/dev/null
+pst alice live --stop >/dev/null
 
 if ((FAILED)); then
     echo "logs kept in $T"
