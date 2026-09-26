@@ -9,6 +9,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -27,7 +28,8 @@ use iroh_moq::{IncomingSessionStream, Moq, MoqProtocolHandler, MoqSession};
 use moq_mux::import::{ContainerFormat, ContainerStream};
 use moq_net::announce::{Kind as AnnounceKind, Update as AnnounceUpdate};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
     process::{Child, Command},
     sync::oneshot,
     task::JoinHandle,
@@ -124,6 +126,9 @@ pub enum Role {
 pub enum Sink {
     Player,
     File(PathBuf),
+    /// One HTTP client at this address, for players pstream can't spawn (an
+    /// Android app, when pstream runs in a shell on the phone).
+    Serve(SocketAddr),
 }
 
 #[derive(Clone)]
@@ -367,13 +372,6 @@ impl Node {
             path: path.clone(),
         };
 
-        let source = moq_mux::Source::new(session.announced().clone(), path.as_str());
-        let mut export = moq_mux::container::ts::Export::new(source)
-            .await
-            .with_context(|| format!("subscribing to {name}"))?
-            .with_max_age(latency.max_age());
-        info!(friend = %name, ?latency, "watching");
-
         let mut output: Pin<Box<dyn tokio::io::AsyncWrite + Send>>;
         let mut player = None;
         match sink {
@@ -395,7 +393,17 @@ impl Node {
                 output = Box::pin(child.stdin.take().expect("stdin is piped"));
                 player = Some(child);
             }
+            Sink::Serve(addr) => output = Box::pin(serve_one(addr).await?),
         }
+
+        // Subscribed only once the sink is ready, so a viewer that took a while
+        // to connect starts at the live edge instead of behind a backlog.
+        let source = moq_mux::Source::new(session.announced().clone(), path.as_str());
+        let mut export = moq_mux::container::ts::Export::new(source)
+            .await
+            .with_context(|| format!("subscribing to {name}"))?
+            .with_max_age(latency.max_age());
+        info!(friend = %name, ?latency, "watching");
 
         let outcome = loop {
             let frame = tokio::select! {
@@ -585,8 +593,13 @@ impl Node {
                 (true, false) => "online",
                 (false, false) => "offline",
             };
+            let path = sessions
+                .get(&id)
+                .and_then(path_summary)
+                .map(|path| format!("  {path}"))
+                .unwrap_or_default();
             let auto = if friend.auto_open { " (auto-open)" } else { "" };
-            out.push_str(&format!("  {:<16} {state}{auto}\n", friend.name));
+            out.push_str(&format!("  {:<16} {state:<8}{path}{auto}\n", friend.name));
         }
         out
     }
@@ -658,6 +671,18 @@ async fn pump(
     }
 }
 
+/// Which network path a session's traffic takes, e.g. "direct, 18 ms".
+///
+/// "relayed" means holepunching hasn't succeeded (yet) and the stream is going
+/// through n0's rate-limited public relay, which is the first suspect when a
+/// stream stutters.
+fn path_summary(session: &MoqSession) -> Option<String> {
+    let paths = session.conn().paths();
+    let path = paths.iter().find(|path| path.is_selected())?;
+    let kind = if path.is_relay() { "relayed" } else { "direct" };
+    Some(format!("{kind}, {} ms", path.rtt().as_millis()))
+}
+
 /// Removes a path from the watching set however the watch ends.
 struct Watching {
     node: Node,
@@ -668,6 +693,34 @@ impl Drop for Watching {
     fn drop(&mut self) {
         self.node.0.watching.lock().unwrap().remove(&self.path);
     }
+}
+
+/// Waits for one HTTP client on `addr` and answers it with an endless MPEG-TS body.
+///
+/// HTTP rather than raw TCP because it's what Android players open from a URL.
+/// The request is read and ignored: there is only one thing to serve.
+async fn serve_one(addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("listening on {addr}"))?;
+    info!("open http://{addr}/ in mpv or VLC to watch");
+    let (stream, client) = listener.accept().await.context("accepting the player")?;
+    debug!(%client, "player connected");
+    let mut stream = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stream.read_line(&mut line).await? == 0 || line.trim().is_empty() {
+            break;
+        }
+    }
+    let mut stream = stream.into_inner();
+    stream
+        .write_all(
+            b"HTTP/1.0 200 OK\r\nContent-Type: video/mp2t\r\nCache-Control: no-store\r\n\r\n",
+        )
+        .await?;
+    Ok(stream)
 }
 
 async fn wait_for(child: &mut Option<Child>) -> std::io::Result<std::process::ExitStatus> {

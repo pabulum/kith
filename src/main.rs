@@ -6,7 +6,7 @@ mod config;
 mod control;
 mod node;
 
-use std::{path::PathBuf, str::FromStr};
+use std::{net::SocketAddr, path::PathBuf, str::FromStr};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -57,6 +57,10 @@ enum Command {
         /// Write the MPEG-TS to a file instead of opening the player.
         #[arg(long)]
         output: Option<PathBuf>,
+        /// Serve the stream over HTTP at this address (e.g. 127.0.0.1:8080) for
+        /// one player to open, instead of starting one.
+        #[arg(long, conflicts_with = "output")]
+        serve: Option<SocketAddr>,
     },
     /// Show who's online and who's live.
     Status,
@@ -119,23 +123,28 @@ async fn main() -> Result<()> {
         Command::Watch {
             who,
             latency,
-            output: Some(output),
-        } => {
-            // A file sink runs in the foreground so scripts can wait on it, which
-            // needs this process to own the endpoint.
+            output,
+            serve,
+        } if output.is_some() || serve.is_some() => {
+            // These sinks run in the foreground so scripts (or a phone shell) can
+            // wait on them, which needs this process to own the endpoint.
             if control::send(&socket, &Request::Status).await?.is_some() {
-                bail!("--output needs its own node; stop `pstream up` first");
+                bail!("--output and --serve need their own node; stop `pstream up` first");
             }
+            let sink = match (output, serve) {
+                (Some(output), _) => Sink::File(output),
+                (None, Some(addr)) => Sink::Serve(addr),
+                (None, None) => unreachable!("guarded above"),
+            };
             let node = Node::start(home, Role::Watch).await?;
-            let result = node.watch(&who, latency, Sink::File(output)).await;
+            let result = tokio::select! {
+                result = node.watch(&who, latency, sink) => result,
+                () = shutdown_signal() => Ok(()),
+            };
             node.shutdown().await;
             result?;
         }
-        Command::Watch {
-            who,
-            latency,
-            output: None,
-        } => {
+        Command::Watch { who, latency, .. } => {
             let request = Request::Watch {
                 who: who.clone(),
                 latency,

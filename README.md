@@ -27,7 +27,8 @@ pstream live                             # stream your screen (portal picker the
 pstream live --source test               # ...or a test pattern
 pstream live --stop
 pstream watch sam [--latency low|normal|smooth]
-pstream status
+pstream watch sam --serve 127.0.0.1:8080 # ...for a player pstream can't start (open the URL in it)
+pstream status                           # who's online or live, and whether the path is direct or relayed
 ```
 
 Without `pstream up` running, `live` and `watch` run in the foreground (Ctrl-C
