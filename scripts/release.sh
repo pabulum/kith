@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-command -v cargo-about >/dev/null || {
+cargo about --version >/dev/null 2>&1 || {
     echo "cargo-about is missing: cargo install --locked cargo-about --features cli" >&2
     exit 1
 }
