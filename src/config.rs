@@ -28,7 +28,15 @@ impl Home {
             Some(dir) => dir,
             None => default_dir()?,
         };
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        // Private when we make it: it holds the key, the friends list and logs.
+        // A directory someone passed in keeps whatever mode they gave it.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self(dir))
     }
 
@@ -113,10 +121,22 @@ impl Home {
         let text = format!("{CONFIG_HEADER}\n{}", toml::to_string_pretty(config)?);
         // Write-then-rename so a crash never leaves a half-written friends list.
         let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+        private_file(&tmp)
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+            .with_context(|| format!("writing {}", tmp.display()))?;
         fs::rename(&tmp, &path).with_context(|| format!("replacing {}", path.display()))?;
         Ok(())
     }
+}
+
+/// Creates or truncates a file only its owner can read: the friends list and
+/// logs say who you talk to. Windows keeps %APPDATA% per-user already.
+pub fn private_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 #[cfg(unix)]

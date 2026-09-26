@@ -126,7 +126,7 @@ fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
     // someone goes looking for it (and it holds the crash an OpenGL retry
     // follows).
     let _ = std::fs::rename(&log, log.with_extension("log.old"));
-    init_logging(std::fs::File::create(&log).ok());
+    init_logging(config::private_file(&log).ok());
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("{info}");
