@@ -41,8 +41,8 @@ cargo about generate --fail -c scripts/about/about.toml scripts/about/about.hbs 
 for triple in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu; do
     cargo build --release --locked --target "$triple" --target-dir "$target"
     case $triple in
-        *windows*) exe=pstream.exe platform=windows-x86_64 ;;
-        *) exe=pstream platform=linux-x86_64 ;;
+        *windows*) exe=kith.exe platform=windows-x86_64 ;;
+        *) exe=kith platform=linux-x86_64 ;;
     esac
     bin=$target/$triple/release/$exe
     for leak in "$HOME" "$USER"; do
@@ -52,7 +52,7 @@ for triple in x86_64-unknown-linux-gnu x86_64-pc-windows-gnu; do
         fi
     done
 
-    name=pstream-$version-$platform
+    name=kith-$version-$platform
     mkdir -p "dist/stage/$name"
     cp "$bin" README.md LICENSE "$notices" "dist/stage/$name/"
     case $platform in

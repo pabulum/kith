@@ -1,5 +1,5 @@
 [package]
-name = "pstream"
+name = "kith"
 version = "0.1.0"
 edition = "2024"
 description = "Peer-to-peer screen streaming to friends over iroh + Media over QUIC"
@@ -23,14 +23,25 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# The desktop app. Not on Android, where pstream is a CLI in `adb shell`.
+# The desktop app. Not on Android, where Kith is a CLI in `adb shell`.
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = "0.36"
 # Already in the tree through egui's links; opens the browser fallback player.
 webbrowser = "1.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+# Desktop sound for streaming, which ffmpeg can't record on Windows: WASAPI
+# loopback, including the process loopback that leaves one app out.
+wasapi = "0.24"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 # Symbol names are half the Windows exe, and panics still say where they happened.

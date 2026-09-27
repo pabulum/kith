@@ -30,13 +30,14 @@ use moq_net::announce::{Kind as AnnounceKind, Update as AnnounceUpdate};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
-    process::{Child, Command},
+    process::{Child, ChildStderr, ChildStdin, Command},
     sync::oneshot,
     task::JoinHandle,
 };
 use tracing::{debug, info, warn};
 
 use crate::{
+    capture::{self, Recorder, Recording, Share},
     config::{Config, Friend, Home, Latency},
     player::{self, Player},
 };
@@ -103,29 +104,30 @@ fn index(friends: &[Friend]) -> Result<HashMap<EndpointId, Friend>> {
         .collect()
 }
 
-/// Where `pstream live` reads MPEG-TS from.
+/// Where `kith live` reads MPEG-TS from.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Capture {
-    /// The `capture` command from config.toml (gpu-screen-recorder by default).
+    /// The screen, through the screen recorder with the `encoder` and
+    /// `silence` settings, or through config.toml's `capture` command.
     Screen,
     /// ffmpeg's test pattern and tone; no screen picker involved.
     Test,
-    /// MPEG-TS piped into pstream's own stdin.
+    /// MPEG-TS piped into Kith's own stdin.
     Stdin,
 }
 
 /// What this process is for, which decides how much of the node runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// `pstream up`: keeps sessions to every friend and reacts when they go live.
+    /// `kith up`: keeps sessions to every friend and reacts when they go live.
     Up,
-    /// A foreground `pstream live`: dials friends so they hear about the stream,
+    /// A foreground `kith live`: dials friends so they hear about the stream,
     /// but doesn't pop players for *their* streams.
     Live,
-    /// A foreground `pstream watch`: dials only the friend being watched.
+    /// A foreground `kith watch`: dials only the friend being watched.
     Watch,
 }
 
@@ -133,8 +135,8 @@ pub enum Role {
 pub enum Sink {
     Player,
     File(PathBuf),
-    /// One HTTP client at this address, for players pstream can't spawn (an
-    /// Android app, when pstream runs in a shell on the phone).
+    /// One HTTP client at this address, for players Kith can't spawn (an
+    /// Android app, when Kith runs in a shell on the phone).
     Serve(SocketAddr),
 }
 
@@ -155,6 +157,9 @@ struct Inner {
     /// Broadcast paths with a player (or file) attached.
     watching: Mutex<HashSet<String>>,
     live: Mutex<Option<LiveHandle>>,
+    /// Why the last stream stopped by itself, when it failed. Cleared by the
+    /// next `go_live`.
+    stream_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Node {
@@ -201,6 +206,7 @@ impl Node {
             live_friends: Mutex::default(),
             watching: Mutex::default(),
             live: Mutex::default(),
+            stream_error: Arc::default(),
         }));
         tokio::spawn(node.clone().run_sessions(incoming));
         if role != Role::Watch {
@@ -213,7 +219,7 @@ impl Node {
         self.0.endpoint.id()
     }
 
-    fn config(&self) -> Config {
+    pub fn config(&self) -> Config {
         self.0.config.read().unwrap().clone()
     }
 
@@ -247,8 +253,9 @@ impl Node {
 
     /// Starts publishing `capture` as `live/<our code>` and tells every
     /// reachable friend.
-    pub fn go_live(&self, capture: Capture) -> Result<LiveHandle> {
-        let (input, child) = self.open_capture(capture)?;
+    pub fn go_live(&self, capture: Capture, share: &Share) -> Result<LiveHandle> {
+        *self.0.stream_error.lock().unwrap() = None;
+        let (input, process) = self.open_capture(capture, share)?;
         let path = live_path(self.id());
         let mut broadcast = self
             .0
@@ -265,7 +272,19 @@ impl Node {
         info!("live as {path}");
 
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(pump(input, child, import, catalog, broadcast, stopped));
+        let stream_error = self.0.stream_error.clone();
+        // A foreground `kith live` hands the error to its caller instead.
+        let log = self.0.role == Role::Up;
+        let task = tokio::spawn(async move {
+            let pumped = pump(input, process, import, catalog, broadcast, stopped).await;
+            if let Err(err) = &pumped {
+                if log {
+                    warn!("stream stopped: {err:#}");
+                }
+                *stream_error.lock().unwrap() = Some(format!("{err:#}"));
+            }
+            pumped
+        });
         // Sessions we already hold carry the announcement; dial everyone else
         // so it reaches them now rather than on their next redial.
         self.dial_friends();
@@ -276,12 +295,12 @@ impl Node {
     }
 
     /// Daemon flavour of [`go_live`](Self::go_live): the handle lives in the node.
-    pub fn start_live(&self, capture: Capture) -> Result<()> {
+    pub fn start_live(&self, capture: Capture, share: &Share) -> Result<()> {
         let mut live = self.0.live.lock().unwrap();
         if live.as_ref().is_some_and(|live| !live.task.is_finished()) {
-            bail!("already live; `pstream live --stop` first");
+            bail!("already live; `kith live --stop` first");
         }
-        *live = Some(self.go_live(capture)?);
+        *live = Some(self.go_live(capture, share)?);
         Ok(())
     }
 
@@ -293,22 +312,66 @@ impl Node {
         }
     }
 
-    fn open_capture(&self, capture: Capture) -> Result<(Input, Option<Child>)> {
-        let argv: Vec<String> = match capture {
+    fn open_capture(
+        &self,
+        capture: Capture,
+        share: &Share,
+    ) -> Result<(Input, Option<CaptureProcess>)> {
+        let recording = match capture {
             Capture::Stdin => return Ok((Box::pin(tokio::io::stdin()), None)),
-            Capture::Screen => self.config().capture,
-            Capture::Test => TEST_CAPTURE.iter().map(|arg| arg.to_string()).collect(),
+            Capture::Screen => self.screen_recording(share)?,
+            Capture::Test => Recording {
+                argv: TEST_CAPTURE.iter().map(|arg| arg.to_string()).collect(),
+                sound: None,
+            },
         };
-        let (program, args) = argv.split_first().context("the capture command is empty")?;
+        let (program, args) = recording
+            .argv
+            .split_first()
+            .context("the capture command is empty")?;
+        let stdin = match recording.sound {
+            Some(_) => Stdio::piped(),
+            None => Stdio::null(),
+        };
         let mut child = Command::new(program)
             .args(args)
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| spawn_error(program, "capture", err))?;
+        if let Some(silence) = &recording.sound {
+            feed_sound(child.stdin.take().expect("stdin is piped"), silence);
+        }
         let stdout = child.stdout.take().expect("stdout is piped");
-        Ok((Box::pin(stdout), Some(child)))
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let process = CaptureProcess {
+            program: program.clone(),
+            complaint: tokio::spawn(last_complaint(program.clone(), stderr)),
+            child,
+        };
+        Ok((Box::pin(stdout), Some(process)))
+    }
+
+    /// config.toml's `capture` command, or else the screen recorder with the
+    /// encoder the `encoder` setting picks here, and without `silence`.
+    fn screen_recording(&self, share: &Share) -> Result<Recording> {
+        let config = self.config();
+        if let Some(argv) = config.capture {
+            return Ok(Recording { argv, sound: None });
+        }
+        let recorder = Recorder::detect()?;
+        let encoder = recorder.choose(&config.encoder)?;
+        let sound = capture::sound(&config.silence, recorder.can_silence);
+        info!("recording with {}, {sound}", encoder.label());
+        #[cfg(windows)]
+        if let Share::Window { handle, label } = share
+            && !capture::share::still_open(*handle)
+        {
+            bail!("the window you picked ({label}) has closed; pick another");
+        }
+        Ok(recorder.command(encoder, &config.silence, share))
     }
 
     // --- Watching ---------------------------------------------------------
@@ -620,6 +683,7 @@ impl Node {
         Snapshot {
             code: self.id(),
             live,
+            stream_error: self.0.stream_error.lock().unwrap().clone(),
             friends,
         }
     }
@@ -631,8 +695,11 @@ impl Node {
             snapshot.code,
             if snapshot.live { "yes" } else { "no" }
         );
+        if let Some(err) = &snapshot.stream_error {
+            out.push_str(&format!("last stream stopped: {err}\n"));
+        }
         if snapshot.friends.is_empty() {
-            out.push_str("friends: none yet (`pstream friend add <name> <code>`)\n");
+            out.push_str("friends: none yet (`kith friend add <name> <code>`)\n");
         }
         for state in &snapshot.friends {
             let presence = match state.presence {
@@ -665,6 +732,8 @@ pub struct Snapshot {
     pub code: EndpointId,
     /// We're streaming.
     pub live: bool,
+    /// Why the last stream stopped by itself, when it failed.
+    pub stream_error: Option<String>,
     pub friends: Vec<FriendState>,
 }
 
@@ -708,30 +777,37 @@ impl LiveHandle {
 /// Feeds capture output into the MPEG-TS importer until EOF or a stop.
 async fn pump(
     mut input: Input,
-    child: Option<Child>,
+    process: Option<CaptureProcess>,
     mut import: ContainerStream,
     mut catalog: moq_mux::catalog::Producer,
     broadcast: moq_net::broadcast::Producer,
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<()> {
     let mut buffer = BytesMut::with_capacity(64 * 1024);
-    let read: Result<()> = async {
+    // Ok(true) when the capture ended by itself rather than by a stop.
+    let read: Result<bool> = async {
         loop {
             buffer.clear();
             tokio::select! {
                 read = input.read_buf(&mut buffer) => {
                     if read.context("reading the capture")? == 0 {
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
-                _ = &mut stopped => return Ok(()),
+                _ = &mut stopped => return Ok(false),
             }
             import.decode(&buffer)?;
         }
     }
     .await;
-    // kill_on_drop stops the capture process.
-    drop(child);
+    let read = match (read, process) {
+        (Ok(true), Some(process)) => match process.failure().await {
+            Some(err) => Err(err),
+            None => Ok(()),
+        },
+        // Dropping the process handle stops it (kill_on_drop).
+        (read, _) => read.map(drop),
+    };
 
     let finished = read
         .and_then(|()| import.finish().map_err(Into::into))
@@ -748,6 +824,71 @@ async fn pump(
             Err(err)
         }
     }
+}
+
+/// Records the desktop sound without `silence` and writes it to the capture's
+/// stdin until the capture goes away, which also stops the recording.
+#[cfg(windows)]
+fn feed_sound(mut stdin: ChildStdin, silence: &[String]) {
+    let mut sound = capture::loopback::start(silence);
+    tokio::spawn(async move {
+        while let Some(chunk) = sound.pcm.recv().await {
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn feed_sound(_: ChildStdin, _: &[String]) {
+    unreachable!("only Windows records the desktop sound for its capture")
+}
+
+/// A capture process, and what it last complained about.
+struct CaptureProcess {
+    program: String,
+    child: Child,
+    /// Finishes when the process's stderr closes, with its last error line.
+    complaint: JoinHandle<Option<String>>,
+}
+
+impl CaptureProcess {
+    /// Why the capture quit, if it failed: its last error line, or its exit status.
+    async fn failure(mut self) -> Option<anyhow::Error> {
+        // Its stdout already closed, so it's exiting. The bound covers a custom
+        // command that closes stdout and keeps running; dropping it kills that.
+        let status = tokio::time::timeout(Duration::from_secs(2), self.child.wait())
+            .await
+            .ok()?
+            .ok()?;
+        if status.success() {
+            return None;
+        }
+        let complaint = tokio::time::timeout(Duration::from_secs(1), self.complaint)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        Some(match complaint {
+            Some(line) => anyhow!("{} stopped: {line}", self.program),
+            None => anyhow!("{} stopped ({status})", self.program),
+        })
+    }
+}
+
+/// Logs a capture's stderr at debug, since gpu-screen-recorder reports its
+/// frame rate every second, and keeps the last line that mentions an error.
+async fn last_complaint(program: String, stderr: ChildStderr) -> Option<String> {
+    let mut lines = BufReader::new(stderr).lines();
+    let mut complaint = None;
+    while let Ok(Some(line)) = lines.next_line().await {
+        debug!("{program}: {line}");
+        if line.to_ascii_lowercase().contains("error") {
+            complaint = Some(line.trim().to_string());
+        }
+    }
+    complaint
 }
 
 /// Which network path a session's traffic takes, e.g. "direct, 18 ms".
@@ -942,7 +1083,7 @@ fn watch_page(title: &str, latency: Latency) -> String {
         Latency::Normal => "1.5",
         Latency::Smooth => "4",
     };
-    let title = format!("pstream: {title}")
+    let title = format!("Kith: {title}")
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -971,12 +1112,12 @@ async fn wait_for(child: &mut Option<Child>) -> std::io::Result<std::process::Ex
 
 /// Says what to do when the capture or player command can't start.
 ///
-/// Windows looks for a bare program name next to pstream.exe before PATH, so
+/// Windows looks for a bare program name next to kith.exe before PATH, so
 /// a portable folder can carry its own mpv.exe.
-fn spawn_error(program: &str, role: &str, err: std::io::Error) -> anyhow::Error {
+pub(crate) fn spawn_error(program: &str, role: &str, err: std::io::Error) -> anyhow::Error {
     if err.kind() == std::io::ErrorKind::NotFound {
         let fix = if cfg!(windows) {
-            "put it next to pstream.exe or on PATH"
+            "put it next to kith.exe or on PATH"
         } else {
             "install it"
         };
@@ -994,12 +1135,12 @@ fn spawn_error(program: &str, role: &str, err: std::io::Error) -> anyhow::Error 
 /// is the notification.
 async fn notify(name: &str) -> bool {
     if cfg!(windows) {
-        info!("{name} is live; `pstream watch {name}` opens the stream");
+        info!("{name} is live; `kith watch {name}` opens the stream");
         return false;
     }
     let output = Command::new("notify-send")
         .args([
-            "--app-name=pstream",
+            "--app-name=Kith",
             "--icon=video-display",
             "--action=watch=Watch",
             "--wait",
@@ -1011,7 +1152,7 @@ async fn notify(name: &str) -> bool {
     match output {
         Ok(output) => String::from_utf8_lossy(&output.stdout).trim() == "watch",
         Err(err) => {
-            warn!("notify-send failed ({err}); `pstream watch {name}` opens the stream");
+            warn!("notify-send failed ({err}); `kith watch {name}` opens the stream");
             false
         }
     }

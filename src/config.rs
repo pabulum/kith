@@ -14,10 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::player::PlayerSetting;
 
-/// The directory pstream keeps its state in.
+/// The directory Kith keeps its state in.
 ///
-/// `--home`/`$PSTREAM_HOME` when given, else `$XDG_CONFIG_HOME/pstream`, else
-/// `~/.config/pstream` (`%APPDATA%\pstream` on Windows). Two homes are two
+/// `--home`/`$KITH_HOME` when given, else `$XDG_CONFIG_HOME/kith`, else
+/// `~/.config/kith` (`%APPDATA%\kith` on Windows). Two homes are two
 /// identities, which is how one machine plays both ends in tests.
 #[derive(Clone, Debug)]
 pub struct Home(PathBuf);
@@ -44,13 +44,13 @@ impl Home {
         &self.0
     }
 
-    /// The control socket `pstream up` listens on: a Unix socket, or a named
+    /// The control socket `kith up` listens on: a Unix socket, or a named
     /// pipe on Windows.
     ///
     /// Named by a hash of the home, because Unix socket paths cap at 108 bytes
     /// and a home can be arbitrarily deep, and pipe names can't hold a path.
     pub fn socket_path(&self) -> PathBuf {
-        let name = format!("pstream-{:016x}", self.hash());
+        let name = format!("kith-{:016x}", self.hash());
         if cfg!(windows) {
             return PathBuf::from(format!(r"\\.\pipe\{name}"));
         }
@@ -58,7 +58,7 @@ impl Home {
             Some(runtime) if !runtime.is_empty() => {
                 PathBuf::from(runtime).join(format!("{name}.sock"))
             }
-            _ => self.0.join("pstream.sock"),
+            _ => self.0.join("kith.sock"),
         }
     }
 
@@ -103,9 +103,7 @@ impl Home {
     pub fn config(&self) -> Result<Config> {
         let path = self.config_path();
         match fs::read_to_string(&path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-            }
+            Ok(text) => Config::parse(&text).with_context(|| format!("parsing {}", path.display())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Written out on first run so the defaults are discoverable and editable.
                 let config = Config::default();
@@ -142,32 +140,41 @@ pub fn private_file(path: &Path) -> std::io::Result<fs::File> {
 #[cfg(unix)]
 fn default_dir() -> Result<PathBuf> {
     Ok(match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(base) if !base.is_empty() => PathBuf::from(base).join("pstream"),
+        Some(base) if !base.is_empty() => PathBuf::from(base).join("kith"),
         _ => PathBuf::from(std::env::var_os("HOME").context("$HOME is not set")?)
-            .join(".config/pstream"),
+            .join(".config/kith"),
     })
 }
 
 #[cfg(windows)]
 fn default_dir() -> Result<PathBuf> {
     let appdata = std::env::var_os("APPDATA").context("%APPDATA% is not set")?;
-    Ok(PathBuf::from(appdata).join("pstream"))
+    Ok(PathBuf::from(appdata).join("kith"))
 }
 
 const CONFIG_HEADER: &str = "\
-# pstream settings. `pstream friend ...` rewrites this file; comments you add are not kept.
+# Kith settings. `kith friend ...` rewrites this file; comments you add are not kept.
 #
 # player:  \"auto\" (mpv if it's installed, else VLC), \"mpv\", \"vlc\", or a command.
 #          A command gets the stream on stdin, or a local URL wherever an
 #          argument says {url}, e.g. [\"vlc\", \"{url}\"].
-# capture: writes MPEG-TS (H.264/H.265 video, AAC audio) to stdout for `pstream live`.
+# encoder: the video encoder for streaming your screen: \"auto\", or a name
+#          from `kith encoders`.
+# silence: apps whose sound stays out of your stream, such as voice chat, so
+#          friends in a call with you don't hear themselves. [] sends it all.
+# capture: optional. A command that records instead of gpu-screen-recorder,
+#          writing MPEG-TS (H.264/HEVC video, AAC audio) to stdout. `encoder`
+#          and `silence` don't apply to it.
 # latency: default for watching: low | normal | smooth.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub player: PlayerSetting,
-    pub capture: Vec<String>,
+    pub encoder: String,
+    pub silence: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<Vec<String>>,
     pub latency: Latency,
     #[serde(rename = "friend")]
     pub friends: Vec<Friend>,
@@ -177,22 +184,19 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             player: PlayerSetting::default(),
-            capture: DEFAULT_CAPTURE.map(String::from).to_vec(),
+            encoder: crate::capture::AUTO.to_string(),
+            silence: vec![crate::capture::DISCORD.to_string()],
+            capture: None,
             latency: Latency::Normal,
             friends: Vec::new(),
         }
     }
 }
 
-/// gpu-screen-recorder through the desktop portal (KDE/GNOME show a picker the
-/// first time; `-restore-portal-session` reuses the choice afterwards).
-///
-/// Scaled to fit 1080p because upload is the budget: 1080p60 HEVC at 8 Mbps is
-/// four viewers on a 40 Mbps uplink, where 4K would be one. `-keyint 1` makes
-/// every MoQ group one second long, which bounds how long a joining or
-/// skipping viewer waits for a keyframe, at some bitrate cost. AAC because the
-/// MPEG-TS importer takes AAC/MP2/AC-3, not Opus.
-const DEFAULT_CAPTURE: [&str; 23] = [
+/// The capture command earlier versions wrote into every config.toml, spelled
+/// out. Nobody chose it, so it reads as no `capture` at all, and the `encoder`
+/// setting applies instead of this copy pinning HEVC.
+const WRITTEN_OUT_CAPTURE: [&str; 23] = [
     "gpu-screen-recorder",
     "-w",
     "portal",
@@ -219,7 +223,19 @@ const DEFAULT_CAPTURE: [&str; 23] = [
 ];
 
 impl Config {
-    /// Adds a friend by the code their pstream shows them.
+    fn parse(text: &str) -> Result<Self, toml::de::Error> {
+        let mut config: Self = toml::from_str(text)?;
+        if config
+            .capture
+            .as_ref()
+            .is_some_and(|argv| argv.iter().eq(WRITTEN_OUT_CAPTURE))
+        {
+            config.capture = None;
+        }
+        Ok(config)
+    }
+
+    /// Adds a friend by the code their Kith shows them.
     pub fn add_friend(
         &mut self,
         name: &str,
@@ -233,8 +249,8 @@ impl Config {
         }
         let id = EndpointId::from_str(code.trim()).with_context(|| {
             format!(
-                "{:?} isn't a pstream code: ask your friend for the 64-character code \
-                 pstream shows them",
+                "{:?} isn't a Kith code: ask your friend for the 64-character code \
+                 Kith shows them",
                 code.trim()
             )
         })?;
@@ -284,7 +300,7 @@ impl Config {
         }
         match EndpointId::from_str(name_or_code) {
             Ok(id) => Ok((id.fmt_short().to_string(), id)),
-            Err(_) => bail!("no friend named {name_or_code:?} (see `pstream friend ls`)"),
+            Err(_) => bail!("no friend named {name_or_code:?} (see `kith friend ls`)"),
         }
     }
 }
@@ -328,5 +344,34 @@ impl Latency {
             Self::Normal => Duration::from_millis(500),
             Self::Smooth => Duration::from_secs(2),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_written_out_default_capture_reads_as_unset() {
+        let quoted: Vec<String> = WRITTEN_OUT_CAPTURE
+            .iter()
+            .map(|arg| format!("{arg:?}"))
+            .collect();
+        let written = format!("capture = [{}]", quoted.join(", "));
+        let config = Config::parse(&written).unwrap();
+        assert_eq!(config.capture, None);
+        assert_eq!(config.encoder, "auto");
+        assert_eq!(config.silence, ["Discord"]);
+
+        let custom = Config::parse(r#"capture = ["ffmpeg", "-f", "x11grab"]"#).unwrap();
+        assert_eq!(custom.capture.unwrap()[0], "ffmpeg");
+    }
+
+    #[test]
+    fn an_unset_capture_isnt_written() {
+        let text = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!text.contains("capture"), "{text}");
+        assert!(text.contains(r#"encoder = "auto""#), "{text}");
+        assert!(text.contains(r#"silence = ["Discord"]"#), "{text}");
     }
 }

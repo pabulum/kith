@@ -3,7 +3,7 @@
 //! mpv reads MPEG-TS on stdin. VLC is handed a local HTTP URL instead, because
 //! on Windows it can't read stdin. A custom command gets that URL wherever an
 //! argument says `{url}`, and stdin otherwise. With neither player installed,
-//! the stream opens in the browser, in a page pstream serves locally.
+//! the stream opens in the browser, in a page Kith serves locally.
 
 use std::{
     env,
@@ -56,10 +56,10 @@ enum Kind {
 
 /// Picks the player for watching `title`.
 ///
-/// `$PSTREAM_PLAYER` overrides config.toml: one of the names, or a command
+/// `$KITH_PLAYER` overrides config.toml: one of the names, or a command
 /// split on whitespace. That's how the smoke tests swap in a headless mpv.
 pub fn resolve(setting: &PlayerSetting, latency: Latency, title: &str) -> Result<Player> {
-    let setting = match env::var("PSTREAM_PLAYER") {
+    let setting = match env::var("KITH_PLAYER") {
         Ok(env) if !env.trim().is_empty() => from_env(&env),
         _ => setting.clone(),
     };
@@ -99,7 +99,7 @@ fn resolve_with(
                 (Some(mpv), _) => Ok(mpv_player(&mpv, latency, title, &default_mpv)),
                 (None, Some(vlc)) => Ok(vlc_player(&vlc, latency, title)),
                 (None, None) if cfg!(target_os = "android") => bail!(
-                    "no video player found: use `pstream watch --serve 127.0.0.1:8080` and \
+                    "no video player found: use `kith watch --serve 127.0.0.1:8080` and \
                      open that URL in a player app"
                 ),
                 (None, None) => Ok(Player::Browser(latency)),
@@ -140,7 +140,7 @@ fn mpv_player(program: &Path, latency: Latency, title: &str, rest: &[String]) ->
     };
     let mut argv = vec![program.to_string_lossy().into_owned()];
     argv.extend(flags.iter().map(|flag| flag.to_string()));
-    argv.push(format!("--title=pstream: {title}"));
+    argv.push(format!("--title=Kith: {title}"));
     argv.extend(rest.iter().cloned());
     Player::Stdin(argv)
 }
@@ -156,7 +156,7 @@ fn vlc_player(program: &Path, latency: Latency, title: &str) -> Player {
     Player::Url(vec![
         program.to_string_lossy().into_owned(),
         format!("--network-caching={caching}"),
-        format!("--meta-title=pstream: {title}"),
+        format!("--meta-title=Kith: {title}"),
         "--no-video-title-show".into(),
         "--play-and-exit".into(),
         "{url}".into(),
@@ -172,7 +172,7 @@ fn is_mpv(program: &str) -> bool {
 
 /// Where a player is installed, if anywhere.
 ///
-/// Next to pstream's own executable comes first, so a portable folder can
+/// Next to Kith's own executable comes first, so a portable folder can
 /// carry one. Then PATH, including the names Flatpak exports (how SteamOS and
 /// other immutable distros install apps). VLC's Windows installer doesn't add
 /// itself to PATH, so its default folders are checked too.
@@ -235,7 +235,7 @@ mod tests {
         };
         assert_eq!(argv[0], "/bin/mpv");
         assert!(argv.contains(&"--profile=low-latency".to_string()));
-        assert!(argv.contains(&"--title=pstream: sam".to_string()));
+        assert!(argv.contains(&"--title=Kith: sam".to_string()));
         assert_eq!(argv.last().unwrap(), "-");
     }
 
@@ -278,7 +278,7 @@ mod tests {
                 "mpv",
                 "--profile=low-latency",
                 "--cache=no",
-                "--title=pstream: sam",
+                "--title=Kith: sam",
                 "--force-window=immediate",
                 "-"
             ]

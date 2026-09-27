@@ -1,4 +1,4 @@
-//! pstream: stream your screen to friends, peer to peer.
+//! Kith: stream your screen to friends, peer to peer.
 //!
 //! See README.md for how to use it.
 
@@ -6,6 +6,7 @@
 // console window. `attach_console` gives subcommands their terminal back.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod capture;
 mod config;
 mod control;
 #[cfg(not(target_os = "android"))]
@@ -20,6 +21,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt::writer::MakeWriterExt};
 
 use crate::{
+    capture::{Recorder, Share},
     config::{Home, Latency},
     control::{Request, Response},
     node::{Capture, Node, Role, Sink},
@@ -30,12 +32,12 @@ use crate::{
     version,
     about = "Stream your screen to friends, peer to peer",
     long_about = "Stream your screen to friends, peer to peer.\n\n\
-                  With no command, pstream opens its window, which keeps you reachable \
-                  like `pstream up`."
+                  With no command, Kith opens its window, which keeps you reachable \
+                  like `kith up`."
 )]
 struct Cli {
     /// State directory (identity, friends, settings). Two homes are two identities.
-    #[arg(long, env = "PSTREAM_HOME", global = true)]
+    #[arg(long, env = "KITH_HOME", global = true)]
     home: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -56,10 +58,12 @@ enum Command {
         /// What to stream.
         #[arg(long, value_enum, default_value = "screen")]
         source: Capture,
-        /// Stop the stream `pstream up` is running.
+        /// Stop the stream `kith up` is running.
         #[arg(long, conflicts_with = "source")]
         stop: bool,
     },
+    /// List the video encoders your screen can be streamed with here.
+    Encoders,
     /// Watch a friend's stream.
     Watch {
         /// Friend name, or a raw code.
@@ -80,7 +84,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum FriendCommand {
-    /// Add a friend by the code `pstream id` printed for them.
+    /// Add a friend by the code `kith id` printed for them.
     Add {
         name: String,
         code: String,
@@ -121,7 +125,7 @@ fn main() -> Result<()> {
 fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
     // A window has no terminal to read on Windows, so the log also goes to a
     // file a friend can send when something breaks, and panics go in it too.
-    let log = home.dir().join("pstream.log");
+    let log = home.dir().join("kith.log");
     // The previous run's log survives one restart, which is usually when
     // someone goes looking for it (and it holds the crash an OpenGL retry
     // follows).
@@ -134,7 +138,7 @@ fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
     }));
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gui::run(runtime, home)))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("pstream crashed")));
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("Kith crashed")));
     let Err(err) = result else { return Ok(()) };
     tracing::error!("{err:#}");
     // Most window failures are the GPU driver refusing DX12 or Vulkan, and
@@ -167,7 +171,7 @@ fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
 fn message_box(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-    let (text, title) = (wide(text), wide("pstream"));
+    let (text, title) = (wide(text), wide("Kith"));
     // SAFETY: both strings are NUL-terminated and outlive the call.
     unsafe {
         MessageBoxW(
@@ -189,7 +193,7 @@ fn app(_: tokio::runtime::Runtime, _: Home) -> Result<()> {
 /// Logs to stderr, and to `file` as well when given.
 fn init_logging(file: Option<std::fs::File>) {
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("pstream=info,warn"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kith=info,warn"));
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
     match file {
         Some(file) => subscriber
@@ -201,7 +205,7 @@ fn init_logging(file: Option<std::fs::File>) {
 }
 
 /// A GUI-subsystem program starts with no console. Attaching to the one it was
-/// run from (if any) lets `pstream status` and friends print there; it fails
+/// run from (if any) lets `kith status` and friends print there; it fails
 /// harmlessly on a double-click, or when a console build already has one.
 #[cfg(windows)]
 fn attach_console() {
@@ -219,9 +223,26 @@ async fn run(home: Home, command: Command) -> Result<()> {
         Command::Live { stop: true, .. } => match control::send(&socket, &Request::Stop).await? {
             Some(response) => report(response)?,
             None => {
-                bail!("`pstream up` isn't running; a foreground `pstream live` stops with Ctrl-C")
+                bail!("`kith up` isn't running; a foreground `kith live` stops with Ctrl-C")
             }
         },
+        Command::Encoders => {
+            let config = home.config()?;
+            let recorder = Recorder::detect()?;
+            print!("{}", recorder.table(&config.encoder));
+            if config.capture.is_some() {
+                println!(
+                    "config.toml's `capture` command records instead, so `encoder` and \
+                     `silence` don't apply."
+                );
+            } else {
+                println!("Pick one in the app, or set encoder = \"<name>\" in config.toml.");
+                println!(
+                    "Sound: {}.",
+                    capture::sound(&config.silence, recorder.can_silence)
+                );
+            }
+        }
         Command::Live { source, .. } => {
             match control::send(&socket, &Request::Live { capture: source }).await? {
                 Some(response) => report(response)?,
@@ -237,7 +258,7 @@ async fn run(home: Home, command: Command) -> Result<()> {
             // These sinks run in the foreground so scripts (or a phone shell) can
             // wait on them, which needs this process to own the endpoint.
             if control::send(&socket, &Request::Status).await?.is_some() {
-                bail!("--output and --serve need their own node; stop `pstream up` first");
+                bail!("--output and --serve need their own node; stop `kith up` first");
             }
             let sink = match (output, serve) {
                 (Some(output), _) => Sink::File(output),
@@ -274,7 +295,7 @@ async fn run(home: Home, command: Command) -> Result<()> {
             Some(response) => report(response)?,
             None => {
                 println!("code: {}", home.secret()?.public());
-                println!("pstream isn't running; `pstream up` keeps you reachable");
+                println!("Kith isn't running; `kith up` keeps you reachable");
             }
         },
     }
@@ -316,12 +337,12 @@ fn report(response: Response) -> Result<()> {
 async fn up(home: Home) -> Result<()> {
     let socket = home.socket_path();
     if control::send(&socket, &Request::Status).await?.is_some() {
-        bail!("pstream is already running for {}", home.dir().display());
+        bail!("Kith is already running for {}", home.dir().display());
     }
     let node = Node::start(home, Role::Up).await?;
-    println!("pstream is up. Your code: {}", node.id());
+    println!("Kith is up. Your code: {}", node.id());
     println!(
-        "Friends add you with: pstream friend add <your name> {}",
+        "Friends add you with: kith friend add <your name> {}",
         node.id()
     );
 
@@ -335,7 +356,7 @@ async fn up(home: Home) -> Result<()> {
 
 async fn live(home: Home, capture: Capture) -> Result<()> {
     let node = Node::start(home, Role::Live).await?;
-    let mut live = node.go_live(capture)?;
+    let mut live = node.go_live(capture, &Share::MainScreen)?;
     println!(
         "Live as {}. Friends who are online are being told. Ctrl-C to stop.",
         node.id()
@@ -367,7 +388,7 @@ async fn friend(home: &Home, command: FriendCommand) -> Result<()> {
         }
         FriendCommand::Ls => {
             if config.friends.is_empty() {
-                println!("no friends yet; `pstream friend add <name> <code>`");
+                println!("no friends yet; `kith friend add <name> <code>`");
             }
             for friend in &config.friends {
                 let auto = if friend.auto_open { "  auto-open" } else { "" };

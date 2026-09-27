@@ -6,16 +6,18 @@
 #
 # Needs wine, the x86_64-pc-windows-gnu rustup target, mingw-w64-gcc, ffmpeg
 # and ffprobe. Uses a throwaway Wine prefix, so ~/.wine is never touched.
-# Usage: scripts/wine-smoke.sh
+# Given a Windows ffmpeg.exe, it also streams from the Windows build.
+# Usage: scripts/wine-smoke.sh [path/to/ffmpeg.exe]
 set -uo pipefail
+WIN_FFMPEG=${1:-}
 
 cd "$(dirname "$0")/.."
 cargo build --quiet || exit 1
 cargo build --quiet --target x86_64-pc-windows-gnu || exit 1
-PSTREAM=./target/debug/pstream
-EXE=./target/x86_64-pc-windows-gnu/debug/pstream.exe
+KITH=./target/debug/kith
+EXE=./target/x86_64-pc-windows-gnu/debug/kith.exe
 
-T=$(mktemp -d -t pstream-wine.XXXX)
+T=$(mktemp -d -t kith-wine.XXXX)
 export WINEPREFIX=$T/wine WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" NO_COLOR=1
 # Headless: nothing here opens a window, and Wine skips its setup dialogs.
 unset DISPLAY WAYLAND_DISPLAY
@@ -44,16 +46,17 @@ frames() {
 
 wineboot -i >/dev/null 2>&1
 W=$(wine "$EXE" id 2>/dev/null | tr -d '\r')
-A=$("$PSTREAM" --home "$T/alice" id)
-"$PSTREAM" --home "$T/alice" friend add win "$W" >/dev/null
+A=$("$KITH" --home "$T/alice" id)
+"$KITH" --home "$T/alice" friend add win "$W" >/dev/null
 wine "$EXE" friend add alice "$A" >/dev/null 2>&1
-[[ -f $WINEPREFIX/drive_c/users/$USER/AppData/Roaming/pstream/secret.key ]] \
+[[ -f $WINEPREFIX/drive_c/users/$USER/AppData/Roaming/kith/secret.key ]] \
     && pass "identity created under %APPDATA%" || fail "no identity under %APPDATA%"
 
-"$PSTREAM" --home "$T/alice" up >"$T/alice.out" 2>"$T/alice.log" &
+"$KITH" --home "$T/alice" up >"$T/alice.out" 2>"$T/alice.log" &
 PIDS+=($!)
-wait_for "$T/alice.out" 'pstream is up' 20 || fail "alice's node didn't start"
-"$PSTREAM" --home "$T/alice" live --source test >/dev/null
+ALICE_UP=$!
+wait_for "$T/alice.out" 'Kith is up' 20 || fail "alice's node didn't start"
+"$KITH" --home "$T/alice" live --source test >/dev/null
 
 # 1. Record over iroh+MoQ into a file (a Z: path is the Linux filesystem).
 timeout 15 wine "$EXE" watch alice --output "Z:${T//\//\\}\\win.ts" 2>"$T/win-record.log"
@@ -65,7 +68,7 @@ n=$(frames "$T/win.ts")
 wine "$EXE" up >"$T/win-up.out" 2>"$T/win-up.log" &
 PIDS+=($!)
 WIN_UP=$!
-wait_for "$T/win-up.out" 'pstream is up' 30 || fail "the Windows node didn't start"
+wait_for "$T/win-up.out" 'Kith is up' 30 || fail "the Windows node didn't start"
 deadline=$((SECONDS + 15))
 until [[ $(wine "$EXE" status 2>/dev/null) == *alice*LIVE* ]] || ((SECONDS > deadline)); do sleep 0.5; done
 status=$(wine "$EXE" status 2>/dev/null)
@@ -87,6 +90,40 @@ if wait_for "$T/win-serve.log" 'open http' 30; then
         || fail "--serve: frames=${n:-none} (see $T/win-serve.log)"
 else
     fail "--serve never listened (see $T/win-serve.log)"
+fi
+
+# 4. Streaming from Windows: the test pattern through ffmpeg.exe, then the
+# screen path with KITH_SCREEN standing in for Windows' screen capture, which
+# Wine lacks. Wine's sound drivers are off, so the stream's sound is Kith's
+# filled-in silence rather than whatever this machine is playing.
+if [[ -n $WIN_FFMPEG ]]; then
+    kill -TERM "$ALICE_UP"; wait "$ALICE_UP" 2>/dev/null
+    wineserver -k 2>/dev/null
+    APP=$T/app
+    mkdir -p "$APP" && cp "$EXE" "$APP/" && ln -s "$(realpath "$WIN_FFMPEG")" "$APP/ffmpeg.exe"
+    export WINEDLLOVERRIDES="mscoree,mshtml,winepulse.drv,winealsa.drv="
+    why=$(timeout 120 wine "$APP/kith.exe" encoders 2>&1 | tr -d '\r')
+    [[ $why == *"wouldn't let ffmpeg capture the screen"* ]] \
+        && pass "without screen capture, encoders says why" || fail "encoders: $why"
+
+    KITH_SCREEN="testsrc2=size=1280x720:rate=30" wine "$APP/kith.exe" live \
+        >"$T/win-live.out" 2>"$T/win-live.log" &
+    PIDS+=($!)
+    WIN_LIVE=$!
+    if wait_for "$T/win-live.log" 'live as' 60; then
+        timeout 12 "$KITH" --home "$T/alice" watch win --output "$T/from-win.ts" 2>"$T/from-win.log"
+        n=$(frames "$T/from-win.ts")
+        audio=$(ffprobe -v error -select_streams a:0 -count_packets \
+            -show_entries stream=nb_read_packets -of csv=p=0 "$T/from-win.ts" 2>/dev/null | head -1)
+        [[ ${n:-0} -gt 150 && ${audio:-0} -gt 100 ]] \
+            && pass "Windows streamed $n frames and $audio sound packets through ffmpeg" \
+            || fail "streaming from Windows: frames=${n:-none} sound=${audio:-none} (see $T/win-live.log)"
+    else
+        fail "the Windows build didn't go live (see $T/win-live.log)"
+    fi
+    kill -TERM "$WIN_LIVE" 2>/dev/null; wait "$WIN_LIVE" 2>/dev/null
+else
+    echo "SKIP  streaming from Windows (pass a Windows ffmpeg.exe to run it)"
 fi
 
 if ((FAILED)); then

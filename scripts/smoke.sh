@@ -8,15 +8,15 @@
 # the plumbing (identity, friend gate, MoQ announce/subscribe, TS import and
 # export, the control socket and handoff to `up`, auto-open and notification
 # paths, the HTTP sink), not NAT traversal.
-# Usage: scripts/smoke.sh [path/to/pstream]
+# Usage: scripts/smoke.sh [path/to/kith]
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
-PSTREAM=${1:-./target/debug/pstream}
+KITH=${1:-./target/debug/kith}
 [[ $# -ge 1 ]] || cargo build --quiet || exit 1
 
 # Honors $TMPDIR.
-T=$(mktemp -d -t pstream-smoke.XXXX)
+T=$(mktemp -d -t kith-smoke.XXXX)
 export NO_COLOR=1
 PIDS=()
 cleanup() {
@@ -28,7 +28,7 @@ trap cleanup EXIT
 FAILED=0
 pass() { echo "PASS  $*"; }
 fail() { echo "FAIL  $*"; FAILED=1; }
-pst() { "$PSTREAM" --home "$T/$1" "${@:2}"; }
+kith() { "$KITH" --home "$T/$1" "${@:2}"; }
 
 # Waits up to $3 seconds for $2 to appear in file $1.
 wait_for() {
@@ -40,10 +40,10 @@ wait_for() {
 }
 
 # Starts alice streaming the test pattern in the background. Called directly
-# rather than through `pst`: a backgrounded function is a subshell, and the
-# signal would go to the subshell instead of pstream.
+# rather than through the `kith` function: a backgrounded function is a
+# subshell, and the signal would go to the subshell instead of the binary.
 start_alice() {
-    "$PSTREAM" --home "$T/alice" live --source test >"$T/alice.out" 2>"$T/alice-$1.log" &
+    "$KITH" --home "$T/alice" live --source test >"$T/alice.out" 2>"$T/alice-$1.log" &
     PIDS+=($!)
     ALICE=$!
     wait_for "$T/alice-$1.log" 'live as' 10 || fail "alice didn't go live ($1)"
@@ -53,14 +53,14 @@ stop_alice() {
     wait "$ALICE" 2>/dev/null
 }
 
-A=$(pst alice id)
-B=$(pst bob id)
-pst alice friend add bob "$B" >/dev/null
-pst bob friend add alice "$A" >/dev/null
+A=$(kith alice id)
+B=$(kith bob id)
+kith alice friend add bob "$B" >/dev/null
+kith bob friend add alice "$A" >/dev/null
 
 # 1. Record alice's stream to a file and check what arrived.
 start_alice record
-timeout 12 "$PSTREAM" --home "$T/bob" watch alice --output "$T/out.ts" 2>"$T/bob-record.log"
+timeout 12 "$KITH" --home "$T/bob" watch alice --output "$T/out.ts" 2>"$T/bob-record.log"
 stop_alice
 frames=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$T/out.ts" 2>/dev/null | head -1)
 codecs=$(ffprobe -v error -show_entries stream=codec_name -of csv=p=0 "$T/out.ts" 2>/dev/null | sort -u | tr '\n' ' ')
@@ -71,9 +71,9 @@ else
 fi
 
 # 2. Watch in the foreground with a player; mpv quits after 90 frames.
-export PSTREAM_PLAYER="mpv --no-config --really-quiet --vo=null --ao=null --frames=90 -"
+export KITH_PLAYER="mpv --no-config --really-quiet --vo=null --ao=null --frames=90 -"
 start_alice player
-if timeout 30 "$PSTREAM" --home "$T/bob" watch alice 2>"$T/bob-player.log" \
+if timeout 30 "$KITH" --home "$T/bob" watch alice 2>"$T/bob-player.log" \
     && grep -q 'player closed' "$T/bob-player.log"; then
     pass "foreground watch played 90 frames in mpv"
 else
@@ -82,18 +82,18 @@ fi
 stop_alice
 
 # 3. bob runs `up` with auto-open; alice going live opens bob's player on its own.
-pst bob friend set alice --auto-open >/dev/null
-"$PSTREAM" --home "$T/bob" up >"$T/bob-up.out" 2>"$T/bob-up.log" &
+kith bob friend set alice --auto-open >/dev/null
+"$KITH" --home "$T/bob" up >"$T/bob-up.out" 2>"$T/bob-up.log" &
 PIDS+=($!)
 BOB_UP=$!
-wait_for "$T/bob-up.out" 'pstream is up' 10 || fail "bob's node didn't start"
+wait_for "$T/bob-up.out" 'Kith is up' 10 || fail "bob's node didn't start"
 start_alice auto
 if wait_for "$T/bob-up.log" 'player closed' 30; then
     pass "auto-open: bob's node opened the player when alice went live"
 else
     fail "auto-open (see $T/bob-up.log)"
 fi
-status=$(pst bob status 2>&1)
+status=$(kith bob status 2>&1)
 if [[ $status == *alice*LIVE* ]]; then
     pass "status over the control socket shows alice LIVE"
 else
@@ -106,11 +106,11 @@ kill -TERM "$BOB_UP"; wait "$BOB_UP" 2>/dev/null
 mkdir -p "$T/bin"
 printf '#!/bin/sh\necho "$@" >> %q\necho watch\n' "$T/notified" >"$T/bin/notify-send"
 chmod +x "$T/bin/notify-send"
-pst bob friend set alice --no-auto-open >/dev/null
-PATH="$T/bin:$PATH" "$PSTREAM" --home "$T/bob" up >"$T/bob-up2.out" 2>"$T/bob-up2.log" &
+kith bob friend set alice --no-auto-open >/dev/null
+PATH="$T/bin:$PATH" "$KITH" --home "$T/bob" up >"$T/bob-up2.out" 2>"$T/bob-up2.log" &
 PIDS+=($!)
 BOB_UP=$!
-wait_for "$T/bob-up2.out" 'pstream is up' 10 || fail "bob's node didn't restart"
+wait_for "$T/bob-up2.out" 'Kith is up' 10 || fail "bob's node didn't restart"
 start_alice notify
 if wait_for "$T/bob-up2.log" 'player closed' 30 && grep -q 'alice is live' "$T/notified"; then
     pass "notification: clicking Watch opened the player"
@@ -119,9 +119,9 @@ else
 fi
 
 # 5. carol isn't alice's friend, so alice refuses her.
-C=$(pst carol id)
-pst carol friend add alice "$A" >/dev/null
-if timeout 30 "$PSTREAM" --home "$T/carol" watch alice --output "$T/carol.ts" 2>"$T/carol.log"; then
+C=$(kith carol id)
+kith carol friend add alice "$A" >/dev/null
+if timeout 30 "$KITH" --home "$T/carol" watch alice --output "$T/carol.ts" 2>"$T/carol.log"; then
     fail "a stranger got alice's stream"
 elif [[ -s $T/carol.ts ]]; then
     fail "a stranger received bytes ($T/carol.ts)"
@@ -133,10 +133,10 @@ stop_alice
 
 # 6. alice runs `up` too, so `live` and `live --stop` are handed to her node
 #    over the control socket. bob's node from check 4 is still watching for her.
-"$PSTREAM" --home "$T/alice" up >"$T/alice-up.out" 2>"$T/alice-up.log" &
+"$KITH" --home "$T/alice" up >"$T/alice-up.out" 2>"$T/alice-up.log" &
 PIDS+=($!)
-wait_for "$T/alice-up.out" 'pstream is up' 10 || fail "alice's node didn't start"
-handoff=$(pst alice live --source test 2>&1)
+wait_for "$T/alice-up.out" 'Kith is up' 10 || fail "alice's node didn't start"
+handoff=$(kith alice live --source test 2>&1)
 if [[ $handoff == live* ]] && wait_for "$T/alice-up.log" 'live as' 10; then
     pass "live handed off to alice's running node"
 else
@@ -145,7 +145,7 @@ fi
 # Waits up to $1 seconds for bob's status to match the glob $2.
 bob_status_matches() {
     local deadline=$((SECONDS + $1))
-    until [[ $(pst bob status 2>&1) == $2 ]]; do
+    until [[ $(kith bob status 2>&1) == $2 ]]; do
         ((SECONDS < deadline)) || return 1
         sleep 0.5
     done
@@ -153,21 +153,21 @@ bob_status_matches() {
 if bob_status_matches 15 '*alice*LIVE*direct,*ms*'; then
     pass "bob's status shows alice LIVE over a direct path"
 else
-    fail "status path: $(pst bob status 2>&1)"
+    fail "status path: $(kith bob status 2>&1)"
 fi
-stopped=$(pst alice live --stop 2>&1)
+stopped=$(kith alice live --stop 2>&1)
 if [[ $stopped == stopped ]] && bob_status_matches 10 '*alice*online*'; then
     pass "live --stop through the control socket ended the stream for bob"
 else
-    fail "stop: $stopped / $(pst bob status 2>&1)"
+    fail "stop: $stopped / $(kith bob status 2>&1)"
 fi
 
 # 7. --serve hands the stream to one HTTP player. It needs bob's own node, so
 #    his `up` goes first.
 kill -TERM "$BOB_UP"; wait "$BOB_UP" 2>/dev/null
-pst alice live --source test >/dev/null
+kith alice live --source test >/dev/null
 PORT=$((20000 + RANDOM % 20000))
-"$PSTREAM" --home "$T/bob" watch alice --serve "127.0.0.1:$PORT" 2>"$T/bob-serve.log" &
+"$KITH" --home "$T/bob" watch alice --serve "127.0.0.1:$PORT" 2>"$T/bob-serve.log" &
 PIDS+=($!)
 BOB_SERVE=$!
 if wait_for "$T/bob-serve.log" 'open http' 20; then
@@ -186,8 +186,8 @@ wait "$BOB_SERVE" 2>/dev/null
 
 # 8. A player command with {url} (how VLC is run) gets a one-time local URL
 #    instead of stdin. ffmpeg stands in, recording 3 s of what it's served.
-if PSTREAM_PLAYER="ffmpeg -v error -i {url} -t 3 -c copy -f mpegts $T/url.ts" \
-    timeout 30 "$PSTREAM" --home "$T/bob" watch alice 2>"$T/bob-url.log" \
+if KITH_PLAYER="ffmpeg -v error -i {url} -t 3 -c copy -f mpegts $T/url.ts" \
+    timeout 30 "$KITH" --home "$T/bob" watch alice 2>"$T/bob-url.log" \
     && grep -q 'player closed' "$T/bob-url.log"; then
     n=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$T/url.ts" 2>/dev/null | head -1)
     if [[ ${n:-0} -gt 60 ]]; then
@@ -210,8 +210,8 @@ cat >"$T/bin/fake-browser" <<EOF
 } >/dev/null 2>&1 &
 EOF
 chmod +x "$T/bin/fake-browser"
-if PSTREAM_PLAYER=browser BROWSER="$T/bin/fake-browser" \
-    timeout 30 "$PSTREAM" --home "$T/bob" watch alice 2>"$T/bob-browser.log" \
+if KITH_PLAYER=browser BROWSER="$T/bin/fake-browser" \
+    timeout 30 "$KITH" --home "$T/bob" watch alice 2>"$T/bob-browser.log" \
     && grep -q 'player closed' "$T/bob-browser.log"; then
     n=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$T/browser.ts" 2>/dev/null | head -1)
     js=$(wc -c <"$T/mpegts.js")
@@ -224,7 +224,7 @@ if PSTREAM_PLAYER=browser BROWSER="$T/bin/fake-browser" \
 else
     fail "browser fallback (see $T/bob-browser.log)"
 fi
-pst alice live --stop >/dev/null
+kith alice live --stop >/dev/null
 
 if ((FAILED)); then
     echo "logs kept in $T"

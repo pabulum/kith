@@ -1,4 +1,4 @@
-//! The control socket between `pstream up` and the other subcommands.
+//! The control socket between `kith up` and the other subcommands.
 //!
 //! One identity means one iroh endpoint: a second process binding the same key
 //! would fight the first for its relay slot. So while `up` runs, `live`,
@@ -14,6 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tracing::warn;
 
 use crate::{
+    capture::Share,
     config::Latency,
     node::{Capture, Node},
 };
@@ -51,7 +52,7 @@ pub async fn send(socket: &Path, request: &Request) -> Result<Option<Response>> 
         {
             return Ok(None);
         }
-        Err(err) => return Err(err).context("connecting to the pstream node"),
+        Err(err) => return Err(err).context("connecting to the Kith node"),
     };
     let (read, mut write) = tokio::io::split(stream);
     let mut line = serde_json::to_string(request)?;
@@ -89,10 +90,10 @@ async fn handle(node: Node, stream: impl AsyncRead + AsyncWrite) -> Result<()> {
         Request::Live {
             capture: Capture::Stdin,
         } => Err(anyhow::anyhow!(
-            "--source stdin only works without `pstream up` running"
+            "--source stdin only works without `kith up` running"
         )),
         Request::Live { capture } => node
-            .start_live(capture)
+            .start_live(capture, &Share::MainScreen)
             .map(|()| "live; friends who are online are being told".to_string()),
         Request::Stop => node
             .stop_live()
