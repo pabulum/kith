@@ -2,11 +2,13 @@
 //!
 //! It's `kith up` with a window. The same node serves the control socket,
 //! so the CLI keeps working alongside it, and the buttons do what `friend`,
-//! `live` and `watch` do.
+//! `live` and `watch` do. Closing the window leaves Kith in the tray, still
+//! reachable, and the window comes back from the tray, from opening Kith
+//! again, or from a `kith://` link.
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -18,8 +20,10 @@ use crate::{
     capture::{self, Recorder, Share},
     config::{Config, Home},
     control::{self, Request},
+    install,
+    link::Link,
     node::{Capture, FriendState, Node, Presence, Role, Sink},
-    player,
+    notify, player, tray,
 };
 
 /// How often the window re-reads the node's state. A snapshot is a few mutex
@@ -34,9 +38,25 @@ const SHARES_RECHECK: Duration = Duration::from_secs(2);
 const RED: Color32 = Color32::from_rgb(0xe0, 0x40, 0x40);
 const GREEN: Color32 = Color32::from_rgb(0x40, 0xb0, 0x60);
 
-pub fn run(runtime: Runtime, home: Home) -> Result<()> {
+/// How the app starts.
+pub struct Start {
+    /// In the tray, without the window, as at login.
+    pub background: bool,
+    /// A `kith://` link to follow once connected.
+    pub link: Option<Link>,
+}
+
+pub fn run(runtime: Runtime, home: Home, start: Start) -> Result<()> {
+    #[cfg(windows)]
+    register(&home);
     let shared = Shared::default();
-    runtime.spawn(start(home.clone(), shared.clone()));
+    let window = AppWindow::default();
+    runtime.spawn(start_node(
+        home.clone(),
+        shared.clone(),
+        window.clone(),
+        start.link,
+    ));
     runtime.spawn_blocking({
         let shared = shared.clone();
         move || {
@@ -45,43 +65,224 @@ pub fn run(runtime: Runtime, home: Home) -> Result<()> {
         }
     });
 
-    let app = App {
-        runtime: runtime.handle().clone(),
-        home,
-        shared: shared.clone(),
-        name: String::new(),
-        code: String::new(),
-        auto_open: false,
-        source: Capture::Screen,
-        share: Share::MainScreen,
-        shares: Vec::new(),
-        #[cfg(windows)]
-        shares_listed: None,
-        shown_stream_error: None,
-        removing: None,
-        was_live: HashSet::new(),
-        browser_fallback: false,
-        player_checked: None,
+    let tray = tray::spawn(window.tray_actions(), start.background);
+    let stays = Stays {
+        tray: tray.is_some(),
+        background: start.background,
     };
+    let result = open_windows(&runtime, &home, &shared, &window, stays);
+    drop(tray);
+
+    // Quitting: end a stream cleanly so viewers see it finish.
+    if let NodeState::Ready(node) = shared.state() {
+        runtime.block_on(node.shutdown());
+    }
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+/// Why closing the window leaves Kith running.
+#[derive(Clone, Copy)]
+struct Stays {
+    /// It's in the tray, to open again from there.
+    tray: bool,
+    /// It was running without a window before, as at login.
+    background: bool,
+}
+
+impl Stays {
+    fn at_all(self) -> bool {
+        self.tray || self.background
+    }
+}
+
+/// Opens the window, and again whenever asked, until Kith quits.
+fn open_windows(
+    runtime: &Runtime,
+    home: &Home,
+    shared: &Shared,
+    window: &AppWindow,
+    stays: Stays,
+) -> Result<()> {
+    let mut open = !stays.background;
+    loop {
+        if open {
+            // A failure goes back to main, which tries again with OpenGL.
+            open_window(runtime, home, shared, window, stays)?;
+            if !stays.at_all() || window.quitting() {
+                return Ok(());
+            }
+            if stays.tray {
+                first_time_in_tray(runtime, home);
+            }
+        }
+        if !window.wait() {
+            return Ok(());
+        }
+        open = true;
+    }
+}
+
+fn open_window(
+    runtime: &Runtime,
+    home: &Home,
+    shared: &Shared,
+    window: &AppWindow,
+    stays: Stays,
+) -> Result<()> {
+    let app = App::new(
+        runtime.handle().clone(),
+        home.clone(),
+        shared.clone(),
+        window.clone(),
+        stays,
+    );
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Kith")
+            // Wayland finds the window's icon through the desktop entry of this name.
+            .with_app_id("kith")
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/kith-256.png"))
+                    .unwrap_or_default(),
+            )
             .with_inner_size([540.0, 580.0])
             .with_min_inner_size([420.0, 360.0]),
         ..Default::default()
     };
     #[cfg(windows)]
     prefer_dx12(&mut options);
-    eframe::run_native("kith", options, Box::new(|_| Ok(Box::new(app))))
-        .map_err(|err| anyhow!("opening the window: {err}"))?;
+    let window = window.clone();
+    eframe::run_native(
+        "kith",
+        options,
+        Box::new(move |creation| {
+            window.opened(&creation.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
+    .map_err(|err| anyhow!("opening the window: {err}"))
+}
 
-    // The window closed: end a stream cleanly so viewers see it finish.
-    if let NodeState::Ready(node) = shared.state() {
-        runtime.block_on(node.shutdown());
+/// Says where Kith went, the first time its window closes into the tray.
+fn first_time_in_tray(runtime: &Runtime, home: &Home) {
+    let marker = home.dir().join(".tray-hint-shown");
+    if marker.exists() {
+        return;
     }
-    runtime.shutdown_timeout(Duration::from_secs(2));
-    Ok(())
+    let _ = std::fs::write(&marker, "");
+    let how = if cfg!(windows) {
+        "Friends can reach you while it's in the tray. To quit, right-click its icon there."
+    } else {
+        "Friends can reach you while it's in the tray. To quit, use its menu there."
+    };
+    runtime.spawn(notify::tell("Kith is still running", how));
+}
+
+/// Gives notifications Kith's name and icon, and points `kith://` links (the
+/// notifications' Watch button) at this program.
+#[cfg(windows)]
+fn register(home: &Home) {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    let id: Vec<u16> = install::APP_ID.encode_utf16().chain([0]).collect();
+    // SAFETY: a NUL-terminated string that outlives the call.
+    unsafe { SetCurrentProcessExplicitAppUserModelID(id.as_ptr()) };
+    if let Err(err) = install::register(home) {
+        tracing::warn!("{err:#}");
+    }
+}
+
+/// The window, as the tray, the control socket and the window itself open,
+/// raise and close it, each from its own thread.
+#[derive(Clone, Default)]
+struct AppWindow(Arc<(Mutex<WindowState>, Condvar)>);
+
+#[derive(Default)]
+struct WindowState {
+    /// The open window's, to raise or close it with.
+    ctx: Option<egui::Context>,
+    /// Asked to open while closed.
+    open: bool,
+    quit: bool,
+}
+
+impl AppWindow {
+    fn state(&self) -> std::sync::MutexGuard<'_, WindowState> {
+        self.0.0.lock().unwrap()
+    }
+
+    fn show(&self) {
+        let mut state = self.state();
+        match &state.ctx {
+            Some(ctx) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            }
+            None => {
+                state.open = true;
+                self.0.1.notify_all();
+            }
+        }
+    }
+
+    fn quit(&self) {
+        let mut state = self.state();
+        state.quit = true;
+        if let Some(ctx) = &state.ctx {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+        }
+        self.0.1.notify_all();
+    }
+
+    fn quitting(&self) -> bool {
+        self.state().quit
+    }
+
+    /// The window is up: from now on it's raised, not reopened.
+    fn opened(&self, ctx: &egui::Context) {
+        let mut state = self.state();
+        state.open = false;
+        if state.quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        state.ctx = Some(ctx.clone());
+    }
+
+    /// The window is closing: asks to show it wait for [`wait`](Self::wait).
+    fn closing(&self) {
+        self.state().ctx = None;
+    }
+
+    /// Blocks until asked to open the window (true) or to quit (false).
+    fn wait(&self) -> bool {
+        let mut state = self.state();
+        while !state.open && !state.quit {
+            state = self.0.1.wait(state).unwrap();
+        }
+        state.open = false;
+        !state.quit
+    }
+
+    fn tray_actions(&self) -> tray::OnAction {
+        let window = self.clone();
+        Arc::new(move |action| match action {
+            tray::Action::Open => window.show(),
+            tray::Action::Quit => window.quit(),
+        })
+    }
+}
+
+impl control::Frontend for AppWindow {
+    fn show(&self) {
+        AppWindow::show(self);
+    }
+
+    fn quit(&self) {
+        AppWindow::quit(self);
+    }
 }
 
 /// DX12 is Windows' own graphics API. Vulkan there also loads the implicit
@@ -97,11 +298,11 @@ fn prefer_dx12(options: &mut eframe::NativeOptions) {
     }
 }
 
-/// Starts the node, then serves the control socket for as long as the window
-/// is open.
-async fn start(home: Home, shared: Shared) {
+/// Starts the node, then serves the control socket for as long as Kith runs.
+async fn start_node(home: Home, shared: Shared, window: AppWindow, link: Option<Link>) {
     let socket = home.socket_path();
-    // One endpoint per identity: a running `kith up` already is this node.
+    // One endpoint per identity: main hands over to a Kith already running,
+    // so one here started at the same moment as this.
     match control::send(&socket, &Request::Status).await {
         Ok(None) => {}
         Ok(Some(_)) => {
@@ -125,7 +326,11 @@ async fn start(home: Home, shared: Shared) {
         }
     };
     shared.set(NodeState::Ready(node.clone()));
-    if let Err(err) = control::serve(node, &socket).await {
+    if let Some(Link::Watch(code)) = link {
+        node.spawn_watch(code.to_string(), None);
+    }
+    let frontend: Arc<dyn control::Frontend> = Arc::new(window);
+    if let Err(err) = control::serve(node, &socket, Some(frontend)).await {
         shared.say(Message::Problem(format!(
             "the command line can't reach this window: {err:#}"
         )));
@@ -145,6 +350,9 @@ struct Inner {
     opening: HashSet<String>,
     /// What the screen recorder can do here, once it has said.
     recorder: Option<Result<Recorder, String>>,
+    /// The stream failure last put in the message bar, so it shows once,
+    /// even when it happened with the window closed.
+    shown_stream_error: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -210,6 +418,10 @@ struct App {
     runtime: Handle,
     home: Home,
     shared: Shared,
+    window: AppWindow,
+    stays: Stays,
+    /// Kith starts at login.
+    autostart: bool,
     /// The add-a-friend form.
     name: String,
     code: String,
@@ -220,8 +432,6 @@ struct App {
     shares: Vec<Share>,
     #[cfg(windows)]
     shares_listed: Option<Instant>,
-    /// The stream failure last put in the message bar, so it shows once.
-    shown_stream_error: Option<String>,
     /// A friend whose Remove was clicked once and awaits confirmation.
     removing: Option<String>,
     /// Friends who were live at the last refresh, so a newly live one can flag
@@ -233,6 +443,10 @@ struct App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self) {
+        self.window.closing();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(REFRESH);
         egui::Panel::bottom("message").show(ui, |ui| self.message(ui));
@@ -254,15 +468,41 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn new(runtime: Handle, home: Home, shared: Shared, window: AppWindow, stays: Stays) -> Self {
+        Self {
+            runtime,
+            home,
+            shared,
+            window,
+            stays,
+            autostart: install::autostart(),
+            name: String::new(),
+            code: String::new(),
+            auto_open: false,
+            source: Capture::Screen,
+            share: Share::MainScreen,
+            shares: Vec::new(),
+            #[cfg(windows)]
+            shares_listed: None,
+            removing: None,
+            was_live: HashSet::new(),
+            browser_fallback: false,
+            player_checked: None,
+        }
+    }
+
     fn main(&mut self, ui: &mut egui::Ui, node: &Node) {
         let snapshot = node.snapshot();
         self.flag_newly_live(ui.ctx(), &snapshot.friends);
-        if snapshot.stream_error != self.shown_stream_error {
-            if let Some(err) = &snapshot.stream_error {
-                self.shared
-                    .say(Message::Problem(format!("Your stream stopped: {err}")));
-            }
-            self.shown_stream_error = snapshot.stream_error.clone();
+        let unseen_error = {
+            let mut inner = self.shared.0.lock().unwrap();
+            let unseen = snapshot.stream_error != inner.shown_stream_error;
+            inner.shown_stream_error = snapshot.stream_error.clone();
+            snapshot.stream_error.clone().filter(|_| unseen)
+        };
+        if let Some(err) = unseen_error {
+            self.shared
+                .say(Message::Problem(format!("Your stream stopped: {err}")));
         }
 
         if self.browser_fallback() {
@@ -310,6 +550,45 @@ impl App {
         ui.separator();
 
         self.add_form(ui, node);
+        ui.separator();
+
+        self.settings(ui);
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        let mut autostart = self.autostart;
+        let hint = if self.stays.tray {
+            "Kith starts in the tray, so friends can reach you without you opening it."
+        } else {
+            "Kith starts without its window, so friends can reach you without you \
+             opening it. Open Kith to see it."
+        };
+        if ui
+            .checkbox(&mut autostart, "Start Kith when you log in")
+            .on_hover_text(hint)
+            .changed()
+        {
+            match install::set_autostart(&self.home, autostart) {
+                Ok(()) => {
+                    self.autostart = autostart;
+                    let news = if autostart {
+                        "Kith will start when you log in."
+                    } else {
+                        "Kith won't start when you log in."
+                    };
+                    self.shared.say(Message::Info(news.into()));
+                }
+                Err(err) => self.shared.say(Message::Problem(format!("{err:#}"))),
+            }
+        }
+        if ui
+            .button("Quit Kith")
+            .on_hover_text("Friends can't reach you until you open Kith again.")
+            .clicked()
+        {
+            self.window.quit();
+        }
     }
 
     fn streaming(&mut self, ui: &mut egui::Ui, node: &Node, live: bool) {
@@ -655,12 +934,17 @@ impl App {
     }
 
     fn message(&self, ui: &mut egui::Ui) {
+        let idle = if self.stays.tray {
+            "Closing this window leaves Kith in the tray, where friends can still reach you."
+        } else if self.stays.background {
+            "Closing this window leaves Kith running, where friends can still reach you."
+        } else {
+            "Friends can reach you while this window is open."
+        };
         match self.shared.message() {
             Some(Message::Info(text)) => ui.label(text),
             Some(Message::Problem(text)) => ui.colored_label(RED, text),
-            None => {
-                ui.label(RichText::new("Friends can reach you while this window is open.").weak())
-            }
+            None => ui.label(RichText::new(idle).weak()),
         };
     }
 }

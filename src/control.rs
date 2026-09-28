@@ -4,11 +4,11 @@
 //! would fight the first for its relay slot. So while `up` runs, `live`,
 //! `watch` and `status` hand their request to it over a Unix socket (a named
 //! pipe on Windows), one JSON line each way, instead of starting a node of
-//! their own.
+//! their own. Opening Kith a second time shows the first one's window.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::warn;
@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::{
     capture::Share,
     config::Latency,
+    link::Link,
     node::{Capture, Node},
 };
 
@@ -31,6 +32,21 @@ pub enum Request {
     },
     Status,
     Reload,
+    /// Show the window, or follow a `kith://` link: what opening Kith again
+    /// does.
+    Open {
+        link: Option<String>,
+    },
+    /// Quit: the window, the tray icon and the node.
+    Quit,
+}
+
+/// What the control socket can ask of the app, when Kith runs as one.
+pub trait Frontend: Send + Sync {
+    /// Shows the window, or brings it forward.
+    fn show(&self);
+    /// Closes the window and quits.
+    fn quit(&self);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,22 +81,32 @@ pub async fn send(socket: &Path, request: &Request) -> Result<Option<Response>> 
     ))
 }
 
-/// Serves requests until the process exits.
-pub async fn serve(node: Node, socket: &Path) -> Result<()> {
+/// Serves requests until the process exits, or until a quit when there's no
+/// `frontend` to hand that to (`kith up`).
+pub async fn serve(node: Node, socket: &Path, frontend: Option<Arc<dyn Frontend>>) -> Result<()> {
     let mut listener = transport::Listener::bind(socket)
         .with_context(|| format!("binding {}", socket.display()))?;
+    let quit = Arc::new(tokio::sync::Notify::new());
     loop {
-        let stream = listener.accept().await?;
-        let node = node.clone();
+        let stream = tokio::select! {
+            stream = listener.accept() => stream?,
+            () = quit.notified() => return Ok(()),
+        };
+        let (node, frontend, quit) = (node.clone(), frontend.clone(), quit.clone());
         tokio::spawn(async move {
-            if let Err(err) = handle(node, stream).await {
+            if let Err(err) = handle(node, stream, frontend, quit).await {
                 warn!("control request failed: {err:#}");
             }
         });
     }
 }
 
-async fn handle(node: Node, stream: impl AsyncRead + AsyncWrite) -> Result<()> {
+async fn handle(
+    node: Node,
+    stream: impl AsyncRead + AsyncWrite,
+    frontend: Option<Arc<dyn Frontend>>,
+    quit: Arc<tokio::sync::Notify>,
+) -> Result<()> {
     let (read, mut write) = tokio::io::split(stream);
     let mut line = String::new();
     BufReader::new(read).read_line(&mut line).await?;
@@ -105,6 +131,14 @@ async fn handle(node: Node, stream: impl AsyncRead + AsyncWrite) -> Result<()> {
         }
         Request::Status => Ok(node.status()),
         Request::Reload => node.reload().map(|()| "reloaded".to_string()),
+        Request::Open { link } => open(&node, frontend.as_deref(), link.as_deref()),
+        Request::Quit => {
+            match &frontend {
+                Some(frontend) => frontend.quit(),
+                None => quit.notify_one(),
+            }
+            Ok("Kith is quitting".to_string())
+        }
     };
     let response = match result {
         Ok(message) => Response { ok: true, message },
@@ -117,6 +151,26 @@ async fn handle(node: Node, stream: impl AsyncRead + AsyncWrite) -> Result<()> {
     reply.push('\n');
     write.write_all(reply.as_bytes()).await?;
     Ok(())
+}
+
+/// Follows a link, or shows the window.
+fn open(node: &Node, frontend: Option<&dyn Frontend>, link: Option<&str>) -> Result<String> {
+    match link.map(str::parse::<Link>).transpose()? {
+        Some(Link::Watch(code)) => {
+            node.spawn_watch(code.to_string(), None);
+            Ok("opening the stream".to_string())
+        }
+        Some(Link::Open) | None => match frontend {
+            Some(frontend) => {
+                frontend.show();
+                Ok("showing Kith".to_string())
+            }
+            None => bail!(
+                "Kith is already running without its window, as `kith up` in a terminal. \
+                 Stop that, then open Kith again"
+            ),
+        },
+    }
 }
 
 #[cfg(unix)]

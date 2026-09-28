@@ -624,7 +624,7 @@ impl Node {
                 let session = session.clone();
                 let path = path.to_string();
                 tokio::spawn(async move {
-                    if !auto_open && !notify(&name).await {
+                    if !auto_open && !crate::notify::live(&name, streamer).await {
                         return;
                     }
                     let latency = node.config().latency;
@@ -1126,35 +1126,6 @@ pub(crate) fn spawn_error(program: &str, role: &str, err: std::io::Error) -> any
         )
     } else {
         anyhow!("starting {program} (the {role} command): {err}")
-    }
-}
-
-/// Shows a desktop notification with a Watch button; true if it was clicked.
-///
-/// Windows has no notify-send; there the log line (and the GUI's LIVE badge)
-/// is the notification.
-async fn notify(name: &str) -> bool {
-    if cfg!(windows) {
-        info!("{name} is live; `kith watch {name}` opens the stream");
-        return false;
-    }
-    let output = Command::new("notify-send")
-        .args([
-            "--app-name=Kith",
-            "--icon=video-display",
-            "--action=watch=Watch",
-            "--wait",
-        ])
-        .arg(format!("{name} is live"))
-        .arg("Watch opens the stream.")
-        .output()
-        .await;
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout).trim() == "watch",
-        Err(err) => {
-            warn!("notify-send failed ({err}); `kith watch {name}` opens the stream");
-            false
-        }
     }
 }
 

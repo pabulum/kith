@@ -76,7 +76,15 @@ status=$(wine "$EXE" status 2>/dev/null)
     || fail "status: $status"
 second=$(timeout 30 wine "$EXE" up 2>&1)
 [[ $second == *"already running"* ]] && pass "a second up is refused" || fail "second up: $second"
-kill -TERM "$WIN_UP"; wait "$WIN_UP" 2>/dev/null
+handler=$(wine reg query 'HKCU\Software\Classes\kith\shell\open\command' 2>/dev/null | tr -d '\r')
+[[ $handler == *'kith.exe" "open" "%1"'* ]] && pass "up registered the kith:// link handler" \
+    || fail "link handler: $handler"
+timeout 30 wine "$EXE" quit >/dev/null 2>&1
+deadline=$((SECONDS + 15))
+while kill -0 "$WIN_UP" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.3; done
+kill -0 "$WIN_UP" 2>/dev/null && fail "quit didn't stop the Windows node" \
+    || pass "quit over the named pipe stopped the Windows node"
+kill -TERM "$WIN_UP" 2>/dev/null; wait "$WIN_UP" 2>/dev/null
 wineserver -k 2>/dev/null
 
 # 3. --serve, with Linux ffmpeg as the player.

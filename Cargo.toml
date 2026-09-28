@@ -29,17 +29,34 @@ eframe = "0.36"
 # Already in the tree through egui's links; opens the browser fallback player.
 webbrowser = "1.2"
 
+# The tray icon and notifications speak D-Bus. zbus is already in the tree
+# for egui's accessibility support, running on its own executor (async-io);
+# asking for zbus's tokio support too would break that.
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util = "0.3"
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+
 [target.'cfg(windows)'.dependencies]
 # Desktop sound for streaming, which ffmpeg can't record on Windows: WASAPI
 # loopback, including the process loopback that leaves one app out.
 wasapi = "0.24"
+# Toast notifications (WinRT). The same version egui's dependencies use.
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_System_Com",
+] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
@@ -59,3 +76,6 @@ hang = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b6
 moq-mux = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
 moq-net = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
 moq-tokio = { git = "https://github.com/moq-dev/moq", rev = "6ab7d1a223e1949a5c2e10b68e29db2e8ab9bdd1" }
+
+[build-dependencies]
+embed-resource = "3.0.11"

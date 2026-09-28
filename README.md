@@ -54,7 +54,6 @@ You also need:
   Windows builds [ffmpeg.org](https://ffmpeg.org/download.html) links to
   (ffmpeg 8.0 or later picks a monitor or a window; older ones stream the
   main screen).
-- **For notifications (Linux, optional):** `notify-send`.
 
 ## Use it
 
@@ -64,9 +63,9 @@ Run `kith` with no arguments (on Windows, double-click `kith.exe`).
 The window shows your code, your friends, and who's live.
 
 1. **Copy** your code and send it to a friend. Put theirs in **Add a friend**.
-2. When a friend goes live, they show as LIVE and Kith's taskbar entry
-   asks for attention. Click **Watch**. Tick **auto-open** to have their
-   stream open by itself next time.
+2. When a friend goes live, a notification says so, with a **Watch**
+   button, and they show as LIVE in the window. Tick **auto-open** to have
+   their stream open by itself next time.
 3. To stream, pick **Screen** or **Test pattern** and click **Go live**. The
    first time, your desktop asks which screen or window to share.
    On Windows, **Share** picks a monitor or one window. A window streams on
@@ -76,7 +75,11 @@ The window shows your code, your friends, and who's live.
    means for the friends watching. **Keep Discord out of the sound**, on by
    default, stops friends in a Discord call with you hearing themselves.
 
-Friends can only reach you while the window (or `kith up`) is running.
+Friends can reach you while Kith runs. Closing the window leaves it in the
+tray (the notification area, on Windows): click its icon to open the window
+again, or use its menu to quit. On a desktop without a tray (GNOME without
+the AppIndicator extension), closing the window quits Kith. Under
+**Settings**, **Start Kith when you log in** starts it in the tray.
 
 ### The command line
 
@@ -92,10 +95,13 @@ kith encoders                         # the video encoders your screen can be st
 kith watch sam [--latency low|normal|smooth]
 kith watch sam --serve 127.0.0.1:8080 # for a player you open yourself, at that URL
 kith status                           # who's online or live, and whether it's direct or relayed
+kith quit                             # stop Kith: the window, the tray icon, or `kith up`
 ```
 
-While the window or `kith up` runs, the other commands go through it.
-Without either, `live` and `watch` run until you press Ctrl-C.
+While Kith runs (the app, or `kith up`), the other commands go through it.
+Without it, `live` and `watch` run until you press Ctrl-C. Opening Kith
+again shows the window it already has, and `kith --background` starts it in
+the tray without one.
 
 ## Players
 
@@ -164,6 +170,11 @@ add your new code.
   rate-limited public server.
 - **Windows warns about an unrecognized app.** Kith isn't code-signed yet.
   Choose **More info**, then **Run anyway**.
+- **No notifications on Windows.** Windows holds them back during games
+  and in Do Not Disturb, and they wait in the notification center.
+- **No Kith in the tray on GNOME.** GNOME shows tray icons only with the
+  AppIndicator extension (Ubuntu turns it on). Without it, closing the
+  window quits Kith.
 
 ## Development
 

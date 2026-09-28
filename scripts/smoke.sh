@@ -2,8 +2,9 @@
 # End-to-end smoke test on one machine: three identities (alice streams, bob
 # watches, carol is a stranger) talking over real iroh connections.
 #
-# Needs ffmpeg, ffprobe and mpv. Nothing pops up on screen: mpv runs with null
-# outputs and a fake notify-send stands in for the desktop notification.
+# Needs ffmpeg, ffprobe and mpv, plus dbus-daemon and python3-gi for the D-Bus
+# notification check. Nothing pops up on screen: mpv runs with null
+# outputs, and fake notification servers stand in for the desktop's.
 # Holepunching between two processes on one host is trivial, so this proves
 # the plumbing (identity, friend gate, MoQ announce/subscribe, TS import and
 # export, the control socket and handoff to `up`, auto-open and notification
@@ -101,21 +102,74 @@ else
 fi
 stop_alice
 
-# 4. Notification path: auto-open off, a fake notify-send "clicks" Watch.
+# 4. Notification path: auto-open off, and the notification's Watch opens the
+#    player. First over D-Bus, on a private session bus whose fake
+#    notification server clicks Watch; then with no bus at all, where Kith
+#    falls back to notify-send and a fake one clicks it.
 kill -TERM "$BOB_UP"; wait "$BOB_UP" 2>/dev/null
+kith bob friend set alice --no-auto-open >/dev/null
+if command -v dbus-daemon >/dev/null && python3 -c 'import gi' 2>/dev/null; then
+    cat >"$T/notifications.py" <<'PY'
+import sys, warnings
+from gi.repository import Gio, GLib
+warnings.simplefilter("ignore", DeprecationWarning)
+XML = """<node><interface name="org.freedesktop.Notifications">
+<method name="Notify"><arg type="s" direction="in"/><arg type="u" direction="in"/>
+<arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="in"/>
+<arg type="as" direction="in"/><arg type="a{sv}" direction="in"/><arg type="i" direction="in"/>
+<arg type="u" direction="out"/></method>
+<signal name="ActionInvoked"><arg type="u"/><arg type="s"/></signal>
+<signal name="NotificationClosed"><arg type="u"/><arg type="u"/></signal>
+</interface></node>"""
+log = open(sys.argv[1], "a")
+interface = Gio.DBusNodeInfo.new_for_xml(XML).interfaces[0]
+def call(bus, sender, path, iface, method, params, invocation):
+    _, _, _, summary, _, actions, hints, _ = params.unpack()
+    log.write(f"{summary}|{' '.join(actions)}|{' '.join(sorted(hints))}\n")
+    log.flush()
+    invocation.return_value(GLib.Variant("(u)", (7,)))
+    def click():
+        bus.emit_signal(None, path, iface, "ActionInvoked", GLib.Variant("(us)", (7, "watch")))
+    if "watch" in actions:
+        GLib.timeout_add(300, click)
+def own(bus, name):
+    bus.register_object("/org/freedesktop/Notifications", interface, call)
+Gio.bus_own_name(Gio.BusType.SESSION, "org.freedesktop.Notifications", 0, own, None, None)
+GLib.MainLoop().run()
+PY
+    { read -r BUS; read -r BUS_PID; } < <(dbus-daemon --session --fork --print-address=1 --print-pid=1)
+    PIDS+=("$BUS_PID")
+    DBUS_SESSION_BUS_ADDRESS=$BUS python3 "$T/notifications.py" "$T/dbus-notified" &
+    PIDS+=($!)
+    DBUS_SESSION_BUS_ADDRESS=$BUS "$KITH" --home "$T/bob" up >"$T/bob-dbus.out" 2>"$T/bob-dbus.log" &
+    PIDS+=($!)
+    BOB_UP=$!
+    wait_for "$T/bob-dbus.out" 'Kith is up' 10 || fail "bob's node didn't restart (D-Bus)"
+    start_alice dbus
+    if wait_for "$T/bob-dbus.log" 'player closed' 30 &&
+        grep -q '^alice is live|default Watch watch Watch|desktop-entry image-data$' "$T/dbus-notified"; then
+        pass "notification over D-Bus: clicking Watch opened the player"
+    else
+        fail "D-Bus notification (see $T/bob-dbus.log and $T/dbus-notified)"
+    fi
+    stop_alice
+    kill -TERM "$BOB_UP"; wait "$BOB_UP" 2>/dev/null
+else
+    echo "SKIP  notification over D-Bus (needs dbus-daemon and python3-gi)"
+fi
 mkdir -p "$T/bin"
 printf '#!/bin/sh\necho "$@" >> %q\necho watch\n' "$T/notified" >"$T/bin/notify-send"
 chmod +x "$T/bin/notify-send"
-kith bob friend set alice --no-auto-open >/dev/null
-PATH="$T/bin:$PATH" "$KITH" --home "$T/bob" up >"$T/bob-up2.out" 2>"$T/bob-up2.log" &
+DBUS_SESSION_BUS_ADDRESS=disabled: PATH="$T/bin:$PATH" "$KITH" --home "$T/bob" up \
+    >"$T/bob-up2.out" 2>"$T/bob-up2.log" &
 PIDS+=($!)
 BOB_UP=$!
 wait_for "$T/bob-up2.out" 'Kith is up' 10 || fail "bob's node didn't restart"
 start_alice notify
 if wait_for "$T/bob-up2.log" 'player closed' 30 && grep -q 'alice is live' "$T/notified"; then
-    pass "notification: clicking Watch opened the player"
+    pass "notification without D-Bus: notify-send's Watch opened the player"
 else
-    fail "notification path (see $T/bob-up2.log)"
+    fail "notify-send notification (see $T/bob-up2.log)"
 fi
 
 # 5. carol isn't alice's friend, so alice refuses her.
@@ -162,9 +216,30 @@ else
     fail "stop: $stopped / $(kith bob status 2>&1)"
 fi
 
-# 7. --serve hands the stream to one HTTP player. It needs bob's own node, so
-#    his `up` goes first.
-kill -TERM "$BOB_UP"; wait "$BOB_UP" 2>/dev/null
+# 7. What opening Kith again sends a running one: a kith://watch link opens
+#    the stream, a bare `open` needs a window `up` doesn't have, and `quit`
+#    stops it.
+players=$(grep -c 'player closed' "$T/bob-up2.log")
+kith alice live --source test >/dev/null
+opened=$(kith bob open "kith://watch/$A" 2>&1)
+deadline=$((SECONDS + 30))
+until (($(grep -c 'player closed' "$T/bob-up2.log") > players)) || ((SECONDS > deadline)); do sleep 0.3; done
+if (($(grep -c 'player closed' "$T/bob-up2.log") > players)); then
+    pass "a kith://watch link handed to bob's node opened the player"
+else
+    fail "watch link: $opened (see $T/bob-up2.log)"
+fi
+kith alice live --stop >/dev/null
+window=$(kith bob open 2>&1)
+[[ $window == *"without its window"* ]] && pass "open says \`up\` has no window" || fail "open: $window"
+kith bob quit >/dev/null
+deadline=$((SECONDS + 10))
+while kill -0 "$BOB_UP" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.2; done
+kill -0 "$BOB_UP" 2>/dev/null && fail "quit didn't stop bob's node" || pass "quit stopped bob's node"
+wait "$BOB_UP" 2>/dev/null
+
+# 8. --serve hands the stream to one HTTP player. It needs bob's own node,
+#    which is why his `up` stopped first.
 kith alice live --source test >/dev/null
 PORT=$((20000 + RANDOM % 20000))
 "$KITH" --home "$T/bob" watch alice --serve "127.0.0.1:$PORT" 2>"$T/bob-serve.log" &
@@ -184,7 +259,7 @@ else
 fi
 wait "$BOB_SERVE" 2>/dev/null
 
-# 8. A player command with {url} (how VLC is run) gets a one-time local URL
+# 9. A player command with {url} (how VLC is run) gets a one-time local URL
 #    instead of stdin. ffmpeg stands in, recording 3 s of what it's served.
 if KITH_PLAYER="ffmpeg -v error -i {url} -t 3 -c copy -f mpegts $T/url.ts" \
     timeout 30 "$KITH" --home "$T/bob" watch alice 2>"$T/bob-url.log" \
@@ -198,8 +273,8 @@ if KITH_PLAYER="ffmpeg -v error -i {url} -t 3 -c copy -f mpegts $T/url.ts" \
 else
     fail "{url} player (see $T/bob-url.log)"
 fi
-# 9. The browser fallback: a fake browser fetches what a real one would, the
-#    page, mpegts.js and a stray favicon, then records 3 s of the stream.
+# 10. The browser fallback: a fake browser fetches what a real one would, the
+#     page, mpegts.js and a stray favicon, then records 3 s of the stream.
 cat >"$T/bin/fake-browser" <<EOF
 #!/bin/sh
 {

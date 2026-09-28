@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- kith.svg simplified for 16 to 24 pixels: no stand, a heavier frame. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff9150"/>
+      <stop offset="1" stop-color="#ee4b5a"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="256" height="256" rx="56" fill="url(#tile)"/>
+  <rect x="32" y="48" width="192" height="160" rx="26" fill="none" stroke="#fff" stroke-width="30"/>
+  <circle cx="96" cy="112" r="24" fill="#fff"/>
+  <circle cx="160" cy="112" r="24" fill="#fff"/>
+  <path d="M56 200 a40 40 0 0 1 80 0 z M120 200 a40 40 0 0 1 80 0 z" fill="#fff"/>
+</svg>

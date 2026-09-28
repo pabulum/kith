@@ -20,10 +20,16 @@ use crate::player::PlayerSetting;
 /// `~/.config/kith` (`%APPDATA%\kith` on Windows). Two homes are two
 /// identities, which is how one machine plays both ends in tests.
 #[derive(Clone, Debug)]
-pub struct Home(PathBuf);
+pub struct Home {
+    dir: PathBuf,
+    /// Given with `--home` or `$KITH_HOME`, so anything that starts Kith
+    /// later (at login, from a link) has to say so too.
+    explicit: bool,
+}
 
 impl Home {
     pub fn resolve(explicit: Option<PathBuf>) -> Result<Self> {
+        let given = explicit.is_some();
         let dir = match explicit {
             Some(dir) => dir,
             None => default_dir()?,
@@ -37,11 +43,23 @@ impl Home {
         builder
             .create(&dir)
             .with_context(|| format!("creating {}", dir.display()))?;
-        Ok(Self(dir))
+        Ok(Self {
+            dir,
+            explicit: given,
+        })
     }
 
     pub fn dir(&self) -> &Path {
-        &self.0
+        &self.dir
+    }
+
+    /// The arguments that start Kith on this home: none for the default one.
+    pub fn args(&self) -> Vec<String> {
+        if self.explicit {
+            vec!["--home".into(), self.dir.display().to_string()]
+        } else {
+            Vec::new()
+        }
     }
 
     /// The control socket `kith up` listens on: a Unix socket, or a named
@@ -58,20 +76,20 @@ impl Home {
             Some(runtime) if !runtime.is_empty() => {
                 PathBuf::from(runtime).join(format!("{name}.sock"))
             }
-            _ => self.0.join("kith.sock"),
+            _ => self.dir.join("kith.sock"),
         }
     }
 
     fn hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let home = fs::canonicalize(&self.0).unwrap_or_else(|_| self.0.clone());
+        let home = fs::canonicalize(&self.dir).unwrap_or_else(|_| self.dir.clone());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         home.hash(&mut hasher);
         hasher.finish()
     }
 
     fn config_path(&self) -> PathBuf {
-        self.0.join("config.toml")
+        self.dir.join("config.toml")
     }
 
     /// Loads the identity key, creating one on first run.
@@ -79,7 +97,7 @@ impl Home {
     /// The key *is* the identity: friends store its public half, so losing or
     /// regenerating it means every friend has to re-add you.
     pub fn secret(&self) -> Result<SecretKey> {
-        let path = self.0.join("secret.key");
+        let path = self.dir.join("secret.key");
         match fs::read_to_string(&path) {
             Ok(text) => SecretKey::from_str(text.trim())
                 .with_context(|| format!("{} is not a valid key", path.display())),

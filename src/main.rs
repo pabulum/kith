@@ -11,8 +11,14 @@ mod config;
 mod control;
 #[cfg(not(target_os = "android"))]
 mod gui;
+#[cfg(not(target_os = "android"))]
+mod install;
+mod link;
 mod node;
+mod notify;
 mod player;
+#[cfg(not(target_os = "android"))]
+mod tray;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Mutex};
 
@@ -32,13 +38,18 @@ use crate::{
     version,
     about = "Stream your screen to friends, peer to peer",
     long_about = "Stream your screen to friends, peer to peer.\n\n\
-                  With no command, Kith opens its window, which keeps you reachable \
-                  like `kith up`."
+                  With no command, Kith opens its window. Like `kith up`, it keeps \
+                  you reachable, and it stays in the tray when the window closes."
 )]
 struct Cli {
     /// State directory (identity, friends, settings). Two homes are two identities.
     #[arg(long, env = "KITH_HOME", global = true)]
     home: Option<PathBuf>,
+
+    /// With no command: start in the tray without opening the window, as Kith
+    /// does at login.
+    #[arg(long)]
+    background: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -80,6 +91,10 @@ enum Command {
     },
     /// Show who's online and who's live.
     Status,
+    /// Open Kith's window, or follow a kith:// link.
+    Open { link: Option<String> },
+    /// Quit the running Kith: its window, tray icon and connections.
+    Quit,
 }
 
 #[derive(Subcommand)]
@@ -113,16 +128,50 @@ fn main() -> Result<()> {
     let home = Home::resolve(cli.home)?;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     match cli.command {
+        None => app(runtime, home, cli.background, None),
+        Some(Command::Open { link }) => app(runtime, home, false, link),
         Some(command) => {
             init_logging(None);
             runtime.block_on(run(home, command))
         }
-        None => app(runtime, home),
     }
 }
 
 #[cfg(not(target_os = "android"))]
-fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
+fn app(
+    runtime: tokio::runtime::Runtime,
+    home: Home,
+    background: bool,
+    link: Option<String>,
+) -> Result<()> {
+    let link = match link.as_deref().map(str::parse::<link::Link>).transpose() {
+        Ok(link) => link,
+        Err(err) => {
+            #[cfg(windows)]
+            message_box(&format!("{err:#}"));
+            return Err(err);
+        }
+    };
+    // One Kith per identity: opening it again hands over to the one running,
+    // which shows its window or follows the link.
+    #[cfg(windows)]
+    let_it_take_focus();
+    let request = if background {
+        Request::Status
+    } else {
+        Request::Open {
+            link: link.as_ref().map(ToString::to_string),
+        }
+    };
+    if let Some(response) = runtime.block_on(control::send(&home.socket_path(), &request))? {
+        if response.ok || background {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        message_box(&response.message);
+        bail!("{}", response.message);
+    }
+
     // A window has no terminal to read on Windows, so the log also goes to a
     // file a friend can send when something breaks, and panics go in it too.
     let log = home.dir().join("kith.log");
@@ -137,8 +186,11 @@ fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
         default_hook(info);
     }));
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gui::run(runtime, home)))
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("Kith crashed")));
+    let start = gui::Start { background, link };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gui::run(runtime, home, start)
+    }))
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("Kith crashed")));
     let Err(err) = result else { return Ok(()) };
     tracing::error!("{err:#}");
     // Most window failures are the GPU driver refusing DX12 or Vulkan, and
@@ -146,9 +198,13 @@ fn app(runtime: tokio::runtime::Runtime, home: Home) -> Result<()> {
     // loop in one process, so the retry is a new one. By now the runtime is
     // gone, and with it this node's endpoint and control socket.
     if std::env::var_os("WGPU_BACKEND").is_none() {
+        // The window was wanted by now, even if Kith started in the background.
+        let args = std::env::args_os()
+            .skip(1)
+            .filter(|arg| arg != install::BACKGROUND);
         let retry = std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
-                .args(std::env::args_os().skip(1))
+                .args(args)
                 .env("WGPU_BACKEND", "gl")
                 .spawn()
         });
@@ -183,8 +239,17 @@ fn message_box(text: &str) {
     };
 }
 
+/// Lets the Kith already running bring its window to the front, which Windows
+/// only allows the program the user just started.
+#[cfg(windows)]
+fn let_it_take_focus() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
+    // SAFETY: takes a process id (any) and touches no memory of ours.
+    unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+}
+
 #[cfg(target_os = "android")]
-fn app(_: tokio::runtime::Runtime, _: Home) -> Result<()> {
+fn app(_: tokio::runtime::Runtime, _: Home, _: bool, _: Option<String>) -> Result<()> {
     use clap::CommandFactory;
     Cli::command().print_help()?;
     Ok(())
@@ -298,6 +363,11 @@ async fn run(home: Home, command: Command) -> Result<()> {
                 println!("Kith isn't running; `kith up` keeps you reachable");
             }
         },
+        Command::Quit => match control::send(&socket, &Request::Quit).await? {
+            Some(response) => report(response)?,
+            None => println!("Kith isn't running"),
+        },
+        Command::Open { .. } => unreachable!("main opens the app"),
     }
     Ok(())
 }
@@ -339,6 +409,11 @@ async fn up(home: Home) -> Result<()> {
     if control::send(&socket, &Request::Status).await?.is_some() {
         bail!("Kith is already running for {}", home.dir().display());
     }
+    // Notifications' Watch button is a kith:// link, which has to lead here.
+    #[cfg(windows)]
+    if let Err(err) = install::register(&home) {
+        tracing::warn!("{err:#}");
+    }
     let node = Node::start(home, Role::Up).await?;
     println!("Kith is up. Your code: {}", node.id());
     println!(
@@ -347,7 +422,7 @@ async fn up(home: Home) -> Result<()> {
     );
 
     let result = tokio::select! {
-        result = control::serve(node.clone(), &socket) => result,
+        result = control::serve(node.clone(), &socket, None) => result,
         () = shutdown_signal() => Ok(()),
     };
     node.shutdown().await;
