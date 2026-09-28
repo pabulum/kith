@@ -39,6 +39,9 @@ use tracing::{debug, info, warn};
 use crate::{
     capture::{self, Recorder, Recording, Share},
     config::{Config, Friend, Home, Latency},
+    invite::{self, Invite},
+    link::Link,
+    notify,
     player::{self, Player},
 };
 
@@ -52,6 +55,11 @@ const PLAYER_TIMEOUT: Duration = Duration::from_secs(60);
 /// Offline friends are retried this often, so a friend who comes online hears
 /// about a stream that's already running.
 const REDIAL_INTERVAL: Duration = Duration::from_secs(30);
+/// How long one invite exchange may take, from either side.
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many invite exchanges are answered at once. Strangers can knock on
+/// that door, and each wrong guess costs a second.
+const PAIRINGS_AT_ONCE: usize = 4;
 
 /// ffmpeg's test pattern and a tone, 1 s GOPs, as MPEG-TS on stdout.
 const TEST_CAPTURE: &[&str] = &[
@@ -160,6 +168,10 @@ struct Inner {
     /// Why the last stream stopped by itself, when it failed. Cleared by the
     /// next `go_live`.
     stream_error: Arc<Mutex<Option<String>>>,
+    /// Friends whose invite is being shown to their Kith right now.
+    pairing: Mutex<HashSet<EndpointId>>,
+    /// Why a friend's Kith turned down their invite.
+    refused: Mutex<HashMap<EndpointId, String>>,
 }
 
 impl Node {
@@ -187,11 +199,17 @@ impl Node {
             inner: moq.protocol_handler(),
             friends: friends.clone(),
         };
+        let (invites, redeem) = tokio::sync::mpsc::channel(PAIRINGS_AT_ONCE);
+        let pairing = Pairing {
+            requests: invites,
+            answering: Arc::new(tokio::sync::Semaphore::new(PAIRINGS_AT_ONCE)),
+        };
         let router = iroh_moq::alpns()
             .into_iter()
             .fold(Router::builder(endpoint.clone()), |router, alpn| {
                 router.accept(alpn, gate.clone())
             })
+            .accept(invite::ALPN, pairing)
             .spawn();
 
         let node = Self(Arc::new(Inner {
@@ -207,8 +225,11 @@ impl Node {
             watching: Mutex::default(),
             live: Mutex::default(),
             stream_error: Arc::default(),
+            pairing: Mutex::default(),
+            refused: Mutex::default(),
         }));
         tokio::spawn(node.clone().run_sessions(incoming));
+        tokio::spawn(node.clone().answer_invites(redeem));
         if role != Role::Watch {
             tokio::spawn(node.clone().redial());
         }
@@ -227,12 +248,14 @@ impl Node {
         self.0.friends.read().unwrap().get(&id).cloned()
     }
 
-    /// Re-reads config.toml, picking up friends added or removed since start.
+    /// Re-reads config.toml, picking up friends added or removed since start,
+    /// and shows new friends' Kith the invites they sent.
     pub fn reload(&self) -> Result<()> {
         let config = self.0.home.config()?;
         *self.0.friends.write().unwrap() = index(&config.friends)?;
         *self.0.config.write().unwrap() = config;
         self.dial_friends();
+        self.show_invites();
         Ok(())
     }
 
@@ -544,8 +567,139 @@ impl Node {
     async fn redial(self) {
         loop {
             self.dial_friends();
+            self.show_invites();
             tokio::time::sleep(REDIAL_INTERVAL).await;
         }
+    }
+
+    // --- Invites ----------------------------------------------------------
+
+    /// Makes an invite link for one friend to use, within a week.
+    pub fn invite(&self) -> Result<String> {
+        let own = self.id();
+        let invite = self.0.home.edit(|config| config.invite(own))?;
+        self.reload()?;
+        Ok(Link::Invite(invite).to_string())
+    }
+
+    /// Adds whoever sent `invite`, and shows their Kith the invite so it adds
+    /// us back: now if they're online, else as soon as they are. Returns the
+    /// name they're saved as.
+    pub fn join(&self, invite: &Invite, name: Option<&str>) -> Result<String> {
+        let own = self.id();
+        let saved = self.0.home.edit(|config| config.join(invite, name, own))?;
+        self.0.refused.lock().unwrap().remove(&invite.from);
+        self.reload()?;
+        Ok(saved)
+    }
+
+    /// Shows each friend's Kith the invite they sent us, if it hasn't
+    /// answered yet. Those who are offline get asked again on the next redial.
+    fn show_invites(&self) {
+        let waiting: Vec<Friend> = self
+            .config()
+            .friends
+            .into_iter()
+            .filter(|friend| friend.invite.is_some())
+            .collect();
+        for friend in waiting {
+            let Ok(id) = friend.id() else { continue };
+            if !self.0.pairing.lock().unwrap().insert(id) {
+                continue;
+            }
+            let node = self.clone();
+            tokio::spawn(async move {
+                if let Err(err) = node.show_invite(&friend).await {
+                    debug!(friend = %friend.name, "couldn't show the invite yet: {err:#}");
+                }
+                node.0.pairing.lock().unwrap().remove(&id);
+            });
+        }
+    }
+
+    async fn show_invite(&self, friend: &Friend) -> Result<()> {
+        let id = friend.id()?;
+        let request = invite::Request {
+            token: friend.invite.clone().context("no invite to show")?,
+            name: invite::clean_name(&self.config().name),
+        };
+        let reply = tokio::time::timeout(PAIRING_TIMEOUT, async {
+            let connection = self.0.endpoint.connect(id, invite::ALPN).await?;
+            let (mut send, mut recv) = connection.open_bi().await?;
+            send.write_all(&serde_json::to_vec(&request)?).await?;
+            send.finish()?;
+            let reply = recv.read_to_end(invite::MESSAGE_LIMIT).await?;
+            connection.close(0u32.into(), b"thanks");
+            anyhow::Ok(serde_json::from_slice::<invite::Reply>(&reply)?)
+        })
+        .await
+        .map_err(|_| anyhow!("timed out"))??;
+
+        // Either way their Kith has answered, so this invite is done.
+        self.0.home.edit(|config| {
+            if let Some(saved) = config.friends.iter_mut().find(|f| f.code == friend.code) {
+                saved.invite = None;
+            }
+            Ok(())
+        })?;
+        match reply {
+            invite::Reply::Friends { .. } => {
+                info!(friend = %friend.name, "added us back, from their invite");
+                let title = format!("You and {} are friends", friend.name);
+                tokio::spawn(
+                    async move { notify::tell(&title, "Their Kith added you back.").await },
+                );
+            }
+            invite::Reply::Refused { reason } => {
+                warn!(friend = %friend.name, "turned down their invite: {reason}");
+                self.0.refused.lock().unwrap().insert(id, reason);
+            }
+        }
+        self.reload()
+    }
+
+    /// Answers friends-to-be using our invites, one request at a time, so
+    /// config.toml changes in order.
+    async fn answer_invites(self, mut requests: tokio::sync::mpsc::Receiver<PairingRequest>) {
+        while let Some((remote, request, answer)) = requests.recv().await {
+            let _ = answer.send(self.redeem(remote, &request));
+        }
+    }
+
+    fn redeem(&self, remote: EndpointId, request: &invite::Request) -> invite::Reply {
+        let redeemed = self.0.home.edit(|config| {
+            let added = config.redeem(remote, request)?;
+            let name = config
+                .friends
+                .iter()
+                .find(|friend| friend.id().ok() == Some(remote))
+                .map(|friend| friend.name.clone())
+                .unwrap_or_default();
+            Ok((added, name, invite::clean_name(&config.name)))
+        });
+        let (added, name, own) = match redeemed {
+            Ok(redeemed) => redeemed,
+            Err(err) => {
+                info!(remote = %remote.fmt_short(), "turned down an invite: {err:#}");
+                return invite::Reply::Refused {
+                    reason: format!("{err:#}"),
+                };
+            }
+        };
+        if let Err(err) = self.reload() {
+            warn!("{err:#}");
+        }
+        if added {
+            info!(friend = %name, "added with one of our invites");
+            tokio::spawn(async move {
+                notify::tell(
+                    &format!("{name} is your friend now"),
+                    "They used your invite.",
+                )
+                .await
+            });
+        }
+        invite::Reply::Friends { name: own }
     }
 
     /// Follows every session, dialed or accepted, for the announcements it carries.
@@ -661,6 +815,7 @@ impl Node {
         let sessions = self.0.sessions.lock().unwrap();
         let live_friends = self.0.live_friends.lock().unwrap();
         let watching = self.0.watching.lock().unwrap();
+        let refused = self.0.refused.lock().unwrap();
 
         let friends = config
             .friends
@@ -675,6 +830,7 @@ impl Node {
                 Some(FriendState {
                     path: sessions.get(&id).and_then(path_summary),
                     watching: watching.contains(&live_path(id)),
+                    refused: refused.get(&id).cloned(),
                     presence,
                     friend,
                 })
@@ -718,10 +874,20 @@ impl Node {
                 ""
             };
             let watching = if state.watching { ", watching" } else { "" };
+            let waiting = if state.waiting() {
+                " (their Kith hasn't added you back yet)"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "  {:<16} {presence:<8}{path}{watching}{auto}\n",
+                "  {:<16} {presence:<8}{path}{watching}{auto}{waiting}\n",
                 state.friend.name
             ));
+            if let Some(reason) = &state.refused {
+                out.push_str(&format!(
+                    "    their Kith turned down the invite: {reason}\n"
+                ));
+            }
         }
         out
     }
@@ -744,6 +910,15 @@ pub struct FriendState {
     pub path: Option<String>,
     /// Their stream is open in a player (or file) here.
     pub watching: bool,
+    /// Why their Kith turned down the invite they sent, if it did.
+    pub refused: Option<String>,
+}
+
+impl FriendState {
+    /// Added from their invite, and their Kith hasn't added us back yet.
+    pub fn waiting(&self) -> bool {
+        self.friend.invite.is_some()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1126,6 +1301,52 @@ pub(crate) fn spawn_error(program: &str, role: &str, err: std::io::Error) -> any
         )
     } else {
         anyhow!("starting {program} (the {role} command): {err}")
+    }
+}
+
+/// An invite someone showed us, with where to send the answer.
+type PairingRequest = (EndpointId, invite::Request, oneshot::Sender<invite::Reply>);
+
+/// Answers invites: the one protocol strangers may speak, since whoever
+/// uses an invite isn't a friend until it's answered. It reads one small
+/// request, hands it to the node, and writes back the reply.
+#[derive(Clone, Debug)]
+struct Pairing {
+    requests: tokio::sync::mpsc::Sender<PairingRequest>,
+    answering: Arc<tokio::sync::Semaphore>,
+}
+
+impl ProtocolHandler for Pairing {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let Ok(_answering) = self.answering.clone().try_acquire_owned() else {
+            connection.close(1u32.into(), b"busy");
+            return Ok(());
+        };
+        let remote = connection.remote_id();
+        let answered = tokio::time::timeout(PAIRING_TIMEOUT, async {
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            let request = recv.read_to_end(invite::MESSAGE_LIMIT).await?;
+            let request: invite::Request = serde_json::from_slice(&request)?;
+            let (answer, reply) = oneshot::channel();
+            self.requests.send((remote, request, answer)).await?;
+            let reply = reply.await?;
+            if matches!(reply, invite::Reply::Refused { .. }) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            send.write_all(&serde_json::to_vec(&reply)?).await?;
+            send.finish()?;
+            anyhow::Ok(())
+        })
+        .await;
+        match answered {
+            Ok(Ok(())) => {
+                // The asker closes once it has read the reply.
+                let _ = tokio::time::timeout(PAIRING_TIMEOUT, connection.closed()).await;
+            }
+            Ok(Err(err)) => debug!(remote = %remote.fmt_short(), "invite exchange failed: {err:#}"),
+            Err(_) => connection.close(2u32.into(), b"too slow"),
+        }
+        Ok(())
     }
 }
 

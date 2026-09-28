@@ -1,5 +1,5 @@
-//! `kith://` links, which open Kith from outside: the Watch button on a
-//! Windows notification, and anything else that can open a link.
+//! `kith://` links, which open Kith from outside: invites, the Watch button
+//! on a Windows notification, and anything else that can open a link.
 //!
 //! The system hands a clicked link to `kith open <link>`, which passes it to
 //! the running Kith (or starts one).
@@ -9,6 +9,8 @@ use std::str::FromStr;
 use anyhow::{Result, bail};
 use iroh::EndpointId;
 
+use crate::invite::Invite;
+
 pub const SCHEME: &str = "kith";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,6 +19,8 @@ pub enum Link {
     Open,
     /// `kith://watch/<code>`: open a friend's stream.
     Watch(EndpointId),
+    /// `kith://invite/<invite>`: someone asking to be friends.
+    Invite(Invite),
 }
 
 impl FromStr for Link {
@@ -38,6 +42,7 @@ impl FromStr for Link {
                 Ok(code) => Ok(Self::Watch(code)),
                 Err(_) => bail!("the link {text:?} names no friend's code"),
             },
+            (Some("invite"), Some(invite), None) => Ok(Self::Invite(Invite::decode(invite)?)),
             _ => bail!("Kith doesn't know what to do with {text:?}; is it up to date?"),
         }
     }
@@ -48,6 +53,7 @@ impl std::fmt::Display for Link {
         match self {
             Self::Open => write!(f, "{SCHEME}://open"),
             Self::Watch(code) => write!(f, "{SCHEME}://watch/{code}"),
+            Self::Invite(invite) => write!(f, "{SCHEME}://invite/{}", invite.encode()),
         }
     }
 }
@@ -73,6 +79,18 @@ mod tests {
         assert_eq!("kith://".parse::<Link>().unwrap(), Link::Open);
         let watch = format!("kith:///watch/{CODE}/");
         assert!(matches!(watch.parse::<Link>().unwrap(), Link::Watch(_)));
+    }
+
+    #[test]
+    fn invites_are_links() {
+        let invite = crate::invite::Invite {
+            from: CODE.parse().unwrap(),
+            name: "Sam".into(),
+            token: crate::invite::Token::generate().unwrap(),
+        };
+        let link = Link::Invite(invite.clone()).to_string();
+        assert!(link.starts_with("kith://invite/"), "{link}");
+        assert_eq!(link.parse::<Link>().unwrap(), Link::Invite(invite));
     }
 
     #[test]

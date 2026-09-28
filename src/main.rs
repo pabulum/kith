@@ -13,6 +13,7 @@ mod control;
 mod gui;
 #[cfg(not(target_os = "android"))]
 mod install;
+mod invite;
 mod link;
 mod node;
 mod notify;
@@ -59,6 +60,19 @@ struct Cli {
 enum Command {
     /// Print your code, which friends add to reach you.
     Id,
+    /// Show or set what friends see you as. Invites carry it.
+    Name { name: Option<String> },
+    /// Make an invite link for one friend: whoever uses it becomes your
+    /// friend. It works once, within a week.
+    Invite,
+    /// Use a friend's invite link. You're friends as soon as their Kith hears
+    /// from yours.
+    Join {
+        link: String,
+        /// What to call them, instead of the name their invite carries.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Add, remove, and list friends.
     #[command(subcommand)]
     Friend(FriendCommand),
@@ -390,6 +404,33 @@ async fn run(home: Home, command: Command) -> Result<()> {
     let socket = home.socket_path();
     match command {
         Command::Id => println!("{}", home.secret()?.public()),
+        Command::Name { name: None } => match home.config()?.name {
+            name if name.is_empty() => println!("not set yet: `kith name <what friends call you>`"),
+            name => println!("{name}"),
+        },
+        Command::Name { name: Some(name) } => {
+            let name = invite::clean_name(&name);
+            if name.is_empty() {
+                bail!("that name is empty once cleaned up; pick another");
+            }
+            home.edit(|config| {
+                config.name = name.clone();
+                Ok(())
+            })?;
+            reload(&socket).await?;
+            println!("Friends see you as {name}");
+        }
+        Command::Invite => {
+            let own = home.secret()?.public();
+            let invite = home.edit(|config| config.invite(own))?;
+            reload(&socket).await?;
+            println!("{}", link::Link::Invite(invite));
+            eprintln!(
+                "Send it to one friend: it works once, within a week. They paste it into \
+                 Kith, or run `kith join <link>`."
+            );
+        }
+        Command::Join { link, name } => join(home, &link, name.as_deref()).await?,
         Command::Friend(command) => friend(&home, command).await?,
         Command::Up => up(home).await?,
         Command::Live { stop: true, .. } => match control::send(&socket, &Request::Stop).await? {
@@ -493,6 +534,70 @@ async fn run(home: Home, command: Command) -> Result<()> {
         Command::Open { .. } => unreachable!("main opens the app"),
     }
     Ok(())
+}
+
+/// Uses an invite. A running Kith shows it to the inviter's Kith; without
+/// one, a node of our own does, and says how that went.
+async fn join(home: Home, link: &str, name: Option<&str>) -> Result<()> {
+    let invite = match link.trim().parse::<link::Link>() {
+        Ok(link::Link::Invite(invite)) => invite,
+        Ok(_) => bail!("that's a Kith link, but not an invite"),
+        // Just the part after kith://invite/ is fine too.
+        Err(_) => invite::Invite::decode(link)?,
+    };
+    let own = home.secret()?.public();
+    let saved = home.edit(|config| config.join(&invite, name, own))?;
+    let socket = home.socket_path();
+    if reload(&socket).await? {
+        println!("Added {saved}. Their Kith adds you back as soon as it hears from yours.");
+        return Ok(());
+    }
+    println!("Added {saved}. Telling their Kith…");
+    let node = Node::start(home, Role::Watch).await?;
+    node.reload()?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let outcome = loop {
+        let snapshot = node.snapshot();
+        let state = snapshot
+            .friends
+            .iter()
+            .find(|state| state.friend.name == saved);
+        match state {
+            Some(state) if state.refused.is_some() => break Err(state.refused.clone().unwrap()),
+            Some(state) if !state.waiting() => break Ok(()),
+            _ if tokio::time::Instant::now() > deadline => break Ok(()),
+            _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+        }
+    };
+    let waiting = node
+        .snapshot()
+        .friends
+        .iter()
+        .any(|state| state.friend.name == saved && state.waiting());
+    node.shutdown().await;
+    match outcome {
+        Err(reason) => bail!(
+            "{saved}'s Kith turned the invite down: {reason}. They stay on your list \
+             until `kith friend rm {saved}`"
+        ),
+        Ok(()) if waiting => println!(
+            "{saved}'s Kith isn't reachable now. It adds you back once you're both online \
+             (with Kith open, or `kith up` running)."
+        ),
+        Ok(()) => println!("You and {saved} are friends."),
+    }
+    Ok(())
+}
+
+/// Has a running Kith pick up a change to config.toml. True if one is
+/// running. Quiet when that works, so a command's output stays its own (an
+/// invite link, say).
+async fn reload(socket: &std::path::Path) -> Result<bool> {
+    match control::send(socket, &Request::Reload).await? {
+        Some(response) if !response.ok => bail!("{}", response.message),
+        Some(_) => Ok(true),
+        None => Ok(false),
+    }
 }
 
 /// `kith uninstall`, which Windows' Apps list runs too, with no console to
@@ -642,8 +747,6 @@ async fn friend(home: &Home, command: FriendCommand) -> Result<()> {
         }
     }
     // A running node gates connections on the friends list, so it has to hear about changes.
-    if let Some(response) = control::send(&home.socket_path(), &Request::Reload).await? {
-        report(response)?;
-    }
+    reload(&home.socket_path()).await?;
     Ok(())
 }

@@ -10,6 +10,10 @@ repository = "https://github.com/pabulum/kith"
 anyhow = "1"
 bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
+# Both already in the tree through iroh: invite secrets, and their compact
+# spelling in a link.
+data-encoding = "2"
+getrandom = "0.4"
 hex = "0.4"
 # Same feature set iroh-live builds iroh with, so feature unification with
 # iroh-moq's copy doesn't surprise us.

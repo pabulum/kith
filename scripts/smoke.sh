@@ -301,7 +301,23 @@ else
 fi
 kith alice live --stop >/dev/null
 
-# 11. Installing for this user: the program in ~/.local/bin, an app menu
+# 11. Invites: erin pastes alice's invite, and then each has the other,
+#     without erin's code going anywhere. The invite works only once.
+kith alice name Alice >/dev/null
+kith erin name Erin >/dev/null
+link=$(kith alice invite 2>/dev/null)
+joined=$(kith erin join "$link" 2>&1)
+if [[ $joined == *"You and Alice are friends"* ]] && kith alice friend ls | grep -q '^Erin ' \
+    && kith erin friend ls | grep -q '^Alice '; then
+    pass "an invite made alice and erin friends with each other"
+else
+    fail "invite: $joined / alice: $(kith alice friend ls | tr '\n' ' ')"
+fi
+again=$(kith dave name Dave && kith dave join "$link" 2>&1)
+[[ $again == *"doesn't work anymore"* ]] && pass "a used invite is turned down" \
+    || fail "a second use of the invite: $again"
+
+# 12. Installing for this user: the program in ~/.local/bin, an app menu
 #     entry that opens kith:// links, and the icon; uninstalling removes them.
 #     A throwaway $HOME stands in for the real one.
 F=$T/installhome

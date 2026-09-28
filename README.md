@@ -79,7 +79,12 @@ it offers to **Install** itself: into the Start menu on Windows (Settings →
 Apps removes it again), or your app menu on Linux. Opening a newer Kith
 later offers to **Update** the installed one.
 
-1. **Copy** your code and send it to a friend. Put theirs in **Add a friend**.
+1. Fill in **Your name**, click **Invite a friend**, and send the link it
+   copies to one friend. They paste it into **Add a friend** (or click it,
+   where their chat app opens `kith://` links), and you're friends with each
+   other. An invite works once, within a week. Swapping codes works too:
+   **Copy** yours, and put theirs in **Add a friend**; each of you adds the
+   other.
 2. When a friend goes live, a notification says so, with a **Watch**
    button, and they show as LIVE in the window. Tick **auto-open** to have
    their stream open by itself next time.
@@ -101,8 +106,11 @@ the AppIndicator extension), closing the window quits Kith. Under
 ### The command line
 
 ```sh
-kith id                               # your code
-kith friend add sam <sam's code>      # sam adds yours too, or neither of you connects
+kith name Sam                         # what friends see you as
+kith invite                           # a link for one friend: using it makes you friends
+kith join <link>                      # use a friend's invite
+kith id                               # your code, the long way round:
+kith friend add sam <sam's code>      # ...sam adds yours too, or neither of you connects
 kith friend set sam --auto-open       # open sam's stream as soon as they go live
 kith up                               # stay reachable without the window
 kith live                             # stream your screen
@@ -141,6 +149,8 @@ browser and the graphics card, and one that can't says so and links to VLC.
 The settings folder is `~/.config/kith` on Linux and `%APPDATA%\kith`
 on Windows. It holds `config.toml`, your key (`secret.key`) and the log
 (`kith.log`). Besides `player`, `config.toml` has:
+
+- `name`: what friends see you as. Invites carry it.
 - `encoder`: the video encoder for streaming your screen. `"auto"` (the
   default) picks the graphics card and H.264; `kith encoders` lists the
   others your computer has, such as `"hevc"` or `"hevc_10bit"`.
@@ -152,6 +162,7 @@ on Windows. It holds `config.toml`, your key (`secret.key`) and the log
   instead of the built-in one, which writes MPEG-TS (H.264 or HEVC video,
   AAC audio) to standard output. `encoder` and `silence` don't apply to it.
 - `latency`: how far behind live you watch by default.
+- `[[invite]]`: the invites you've made that nobody has used yet.
 
 `--home <dir>` or `KITH_HOME` uses another folder, which is how one
 computer can be two people.
@@ -161,6 +172,9 @@ add your new code.
 
 ## Privacy
 
+- **An invite is your code plus your say-so:** whoever uses it first becomes
+  your friend. Send it only to the friend it's for. It works once, and not
+  after a week.
 - **Your friends can see your IP address.** A direct connection needs it, as
   in most peer-to-peer games and calls.
 - **So can anyone who has your code,** even if you haven't added them: setting

@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::{
     capture::Share,
     config::Latency,
+    invite::Invite,
     link::Link,
     node::{Capture, Node},
 };
@@ -49,6 +50,8 @@ pub trait Frontend: Send + Sync {
     fn show(&self);
     /// Closes the window and quits.
     fn quit(&self);
+    /// Shows an invite someone opened, to accept or not.
+    fn invited(&self, invite: Invite);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -163,6 +166,18 @@ fn open(node: &Node, frontend: Option<&dyn Frontend>, link: Option<&str>) -> Res
             node.spawn_watch(code.to_string(), None);
             Ok("opening the stream".to_string())
         }
+        // Accepting one needs the person there to say yes: a web page can
+        // open a link too.
+        Some(Link::Invite(invite)) => match frontend {
+            Some(frontend) => {
+                frontend.invited(invite);
+                Ok("showing the invite".to_string())
+            }
+            None => bail!(
+                "Kith is running without its window, which asks before accepting an \
+                 invite: use `kith join <link>`, or open Kith's window"
+            ),
+        },
         Some(Link::Open) | None => match frontend {
             Some(frontend) => {
                 frontend.show();

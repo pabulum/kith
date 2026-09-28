@@ -22,6 +22,7 @@ use crate::{
     config::{Config, Home},
     control::{self, Request},
     install,
+    invite::{self, Invite},
     link::Link,
     node::{Capture, FriendState, Node, Presence, Role, Sink},
     notify, player, tray,
@@ -210,6 +211,8 @@ struct WindowState {
     quit: bool,
     /// What to start once quit: the installed Kith.
     then: Option<PathBuf>,
+    /// An invite someone opened, waiting for a yes or no.
+    invited: Option<Invite>,
 }
 
 impl AppWindow {
@@ -293,6 +296,11 @@ impl control::Frontend for AppWindow {
 
     fn quit(&self) {
         AppWindow::quit(self);
+    }
+
+    fn invited(&self, invite: Invite) {
+        self.state().invited = Some(invite);
+        AppWindow::show(self);
     }
 }
 
@@ -441,7 +449,9 @@ struct App {
     installed: bool,
     /// Uninstall was clicked once and awaits confirmation.
     uninstalling: bool,
-    /// The add-a-friend form.
+    /// What friends see you as, while being edited.
+    own_name: String,
+    /// The add-a-friend form: their invite or code, and a name for them.
     name: String,
     code: String,
     auto_open: bool,
@@ -488,6 +498,7 @@ impl eframe::App for App {
 
 impl App {
     fn new(runtime: Handle, home: Home, shared: Shared, window: AppWindow, stays: Stays) -> Self {
+        let own_name = home.config().map(|config| config.name).unwrap_or_default();
         Self {
             runtime,
             home,
@@ -498,6 +509,7 @@ impl App {
             offer: install::offer(),
             installed: install::installed().is_some(),
             uninstalling: false,
+            own_name,
             name: String::new(),
             code: String::new(),
             auto_open: false,
@@ -538,19 +550,8 @@ impl App {
             ui.separator();
         }
 
-        ui.heading("Your code");
-        ui.label(
-            "Send it to your friends. They add it, and you add theirs: Kith only \
-             connects friends who have added each other.",
-        );
-        ui.horizontal(|ui| {
-            let code = snapshot.code.to_string();
-            ui.monospace(format!("{}…{}", &code[..8], &code[code.len() - 8..]));
-            if ui.button("Copy").clicked() {
-                ui.ctx().copy_text(code);
-                self.shared.say(Message::Info("Copied your code.".into()));
-            }
-        });
+        self.invite_banner(ui, node);
+        self.you(ui, node, &snapshot.code.to_string());
         ui.separator();
 
         self.streaming(ui, node, snapshot.live);
@@ -699,6 +700,137 @@ impl App {
                 self.uninstalling = false;
             }
         });
+    }
+
+    /// Your name, an invite to send, and your code for the long way round.
+    fn you(&mut self, ui: &mut egui::Ui, node: &Node, code: &str) {
+        ui.heading("You");
+        ui.horizontal(|ui| {
+            ui.label("Your name");
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.own_name)
+                    .hint_text("what friends see")
+                    .desired_width(200.0),
+            );
+            if field.lost_focus() {
+                self.save_own_name(node);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let named = !invite::clean_name(&self.own_name).is_empty();
+            let button = ui
+                .add_enabled(
+                    named,
+                    egui::Button::new(RichText::new("Invite a friend").strong()),
+                )
+                .on_hover_text(
+                    "Copies a link for one friend. When they paste it into Kith, you're \
+                     friends with each other. It works once, within a week.",
+                )
+                .on_disabled_hover_text("Fill in your name first: the invite carries it.");
+            if button.clicked() {
+                self.save_own_name(node);
+                let _runtime = self.runtime.enter();
+                match node.invite() {
+                    Ok(link) => {
+                        ui.ctx().copy_text(link);
+                        self.shared.say(Message::Info(
+                            "Copied an invite. Send it to one friend: it works once, within \
+                             a week."
+                                .into(),
+                        ));
+                    }
+                    Err(err) => self.shared.say(Message::Problem(format!("{err:#}"))),
+                }
+            }
+            ui.label(RichText::new("or send your code:").weak());
+            ui.monospace(format!("{}…{}", &code[..8], &code[code.len() - 8..]));
+            if ui.small_button("Copy").clicked() {
+                ui.ctx().copy_text(code.to_string());
+                self.shared.say(Message::Info(
+                    "Copied your code. Your friend adds it, and you add theirs.".into(),
+                ));
+            }
+        });
+    }
+
+    /// Saves the name field, if it changed.
+    fn save_own_name(&mut self, node: &Node) {
+        let name = invite::clean_name(&self.own_name);
+        if name.is_empty() || name == node.config().name {
+            return;
+        }
+        self.own_name = name.clone();
+        self.edit_config(node, |config| {
+            config.name = name.clone();
+            Ok(format!("Friends see you as {name}."))
+        });
+    }
+
+    /// An invite someone opened as a link: add them, or not.
+    fn invite_banner(&mut self, ui: &mut egui::Ui, node: &Node) {
+        let Some(invite) = self.window.state().invited.clone() else {
+            return;
+        };
+        let who = if invite.name.is_empty() {
+            "Someone".to_string()
+        } else {
+            invite.name.clone()
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(format!("{who} invited you to be friends.")).strong());
+            if node.config().name.is_empty() {
+                ui.label("Your name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.own_name)
+                        .hint_text("what they'll see")
+                        .desired_width(140.0),
+                );
+            }
+            let named = !invite::clean_name(&self.own_name).is_empty();
+            if ui
+                .add_enabled(named, egui::Button::new(format!("Add {who}")))
+                .on_disabled_hover_text("Fill in your name first: their Kith saves you under it.")
+                .clicked()
+            {
+                self.save_own_name(node);
+                self.join(node, &invite, None, false);
+                self.window.state().invited = None;
+            }
+            if ui.button("No thanks").clicked() {
+                self.window.state().invited = None;
+            }
+        });
+        ui.separator();
+    }
+
+    /// Adds whoever sent `invite`; their Kith adds us back once it hears
+    /// from ours. True if that worked.
+    fn join(&self, node: &Node, invite: &Invite, name: Option<&str>, auto_open: bool) -> bool {
+        // Showing the invite to their Kith spawns tasks.
+        let _runtime = self.runtime.enter();
+        let joined = node.join(invite, name).and_then(|saved| {
+            if auto_open {
+                self.home.edit(|config| {
+                    config.friend_mut(&saved)?.auto_open = true;
+                    Ok(())
+                })?;
+                node.reload()?;
+            }
+            Ok(saved)
+        });
+        match joined {
+            Ok(saved) => {
+                self.shared.say(Message::Info(format!(
+                    "Added {saved}. You're friends once their Kith hears from yours."
+                )));
+                true
+            }
+            Err(err) => {
+                self.shared.say(Message::Problem(format!("{err:#}")));
+                false
+            }
+        }
     }
 
     fn streaming(&mut self, ui: &mut egui::Ui, node: &Node, live: bool) {
@@ -869,7 +1001,18 @@ impl App {
             Presence::Offline => (ui.visuals().weak_text_color(), "offline"),
         };
         ui.label(RichText::new(name).strong());
-        ui.label(RichText::new(presence).color(color));
+        if let Some(reason) = &state.refused {
+            ui.label(RichText::new("turned down").color(RED))
+                .on_hover_text(format!("Their Kith turned down the invite: {reason}"));
+        } else if state.waiting() {
+            ui.label(RichText::new("waiting").color(ui.visuals().weak_text_color()))
+                .on_hover_text(
+                    "Added from their invite. You're friends as soon as their Kith hears \
+                     from yours, which needs both of you to have Kith open.",
+                );
+        } else {
+            ui.label(RichText::new(presence).color(color));
+        }
         ui.label(state.path.as_deref().unwrap_or("")).on_hover_text(
             "direct: peer to peer. relayed: through a public relay server, \
              which can cap the quality.",
@@ -940,21 +1083,26 @@ impl App {
 
     fn add_form(&mut self, ui: &mut egui::Ui, node: &Node) {
         ui.heading("Add a friend");
+        let invite = parse_invite(&self.code);
         egui::Grid::new("add")
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Name");
+                ui.label("Their invite");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.name)
-                        .hint_text("what you call them")
+                    egui::TextEdit::singleline(&mut self.code)
+                        .hint_text("the link they sent, or their 64-character code")
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
-                ui.label("Their code");
+                ui.label("Name");
+                let hint = match &invite {
+                    Some(invite) if !invite.name.is_empty() => invite.name.clone(),
+                    _ => "what you call them".to_string(),
+                };
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.code)
-                        .hint_text("the 64 characters their Kith shows")
+                    egui::TextEdit::singleline(&mut self.name)
+                        .hint_text(hint)
                         .desired_width(f32::INFINITY),
                 );
                 ui.end_row();
@@ -964,15 +1112,23 @@ impl App {
             "Open their stream as soon as they go live",
         );
         if ui.button("Add").clicked() {
-            let own = node.id();
-            let (name, code, auto_open) = (self.name.clone(), self.code.clone(), self.auto_open);
-            let added = self.edit_config(node, |config| {
-                config.add_friend(&name, &code, auto_open, own)?;
-                Ok(format!(
-                    "Added {}. They need to add your code too.",
-                    name.trim()
-                ))
-            });
+            let added = if let Some(invite) = invite {
+                self.save_own_name(node);
+                let name = Some(self.name.trim()).filter(|name| !name.is_empty());
+                self.join(node, &invite, name, self.auto_open)
+            } else {
+                let own = node.id();
+                let (name, code, auto_open) =
+                    (self.name.clone(), self.code.clone(), self.auto_open);
+                self.edit_config(node, |config| {
+                    config.add_friend(&name, &code, auto_open, own)?;
+                    Ok(format!(
+                        "Added {}. They need to add your code too, or send you an invite \
+                         instead, which does both.",
+                        name.trim()
+                    ))
+                })
+            };
             if added {
                 self.name.clear();
                 self.code.clear();
@@ -985,9 +1141,7 @@ impl App {
     /// either way the outcome is shown.
     fn edit_config(&self, node: &Node, edit: impl FnOnce(&mut Config) -> Result<String>) -> bool {
         let result = (|| {
-            let mut config = self.home.config()?;
-            let news = edit(&mut config)?;
-            self.home.save(&config)?;
+            let news = self.home.edit(edit)?;
             // Reloading redials friends, which spawns tasks.
             let _runtime = self.runtime.enter();
             node.reload()?;
@@ -1056,5 +1210,16 @@ impl App {
             Some(Message::Problem(text)) => ui.colored_label(RED, text),
             None => ui.label(RichText::new(idle).weak()),
         };
+    }
+}
+
+/// An invite in the add-a-friend box: the whole link, or just its last part.
+fn parse_invite(text: &str) -> Option<Invite> {
+    let text = text.trim();
+    match text.parse::<Link>() {
+        Ok(Link::Invite(invite)) => Some(invite),
+        Ok(_) => None,
+        // A 64-character code is hex, which never decodes as an invite's base32.
+        Err(_) => Invite::decode(text).ok(),
     }
 }

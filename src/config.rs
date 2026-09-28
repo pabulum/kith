@@ -12,7 +12,10 @@ use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 
-use crate::player::PlayerSetting;
+use crate::{
+    invite::{self, Invite, Outstanding},
+    player::PlayerSetting,
+};
 
 /// The directory Kith keeps its state in.
 ///
@@ -132,6 +135,19 @@ impl Home {
         }
     }
 
+    /// Loads config.toml, changes it and saves it, with no other change from
+    /// this process in between: the window and the node both edit it.
+    pub fn edit<T>(&self, edit: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
+        static EDITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _editing = EDITING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut config = self.config()?;
+        let result = edit(&mut config)?;
+        self.save(&config)?;
+        Ok(result)
+    }
+
     pub fn save(&self, config: &Config) -> Result<()> {
         let path = self.config_path();
         let text = format!("{CONFIG_HEADER}\n{}", toml::to_string_pretty(config)?);
@@ -173,6 +189,7 @@ fn default_dir() -> Result<PathBuf> {
 const CONFIG_HEADER: &str = "\
 # Kith settings. `kith friend ...` rewrites this file; comments you add are not kept.
 #
+# name:    what friends see you as: invites you make carry it.
 # player:  \"auto\" (mpv if it's installed, else VLC), \"mpv\", \"vlc\", or a command.
 #          A command gets the stream on stdin, or a local URL wherever an
 #          argument says {url}, e.g. [\"vlc\", \"{url}\"].
@@ -183,11 +200,15 @@ const CONFIG_HEADER: &str = "\
 # capture: optional. A command that records instead of gpu-screen-recorder,
 #          writing MPEG-TS (H.264/HEVC video, AAC audio) to stdout. `encoder`
 #          and `silence` don't apply to it.
-# latency: default for watching: low | normal | smooth.";
+# latency: default for watching: low | normal | smooth.
+# [[invite]]: invites you've made that nobody has used yet. Each works once,
+#          within a week.";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// What friends see you as.
+    pub name: String,
     pub player: PlayerSetting,
     pub encoder: String,
     pub silence: Vec<String>,
@@ -196,17 +217,21 @@ pub struct Config {
     pub latency: Latency,
     #[serde(rename = "friend")]
     pub friends: Vec<Friend>,
+    #[serde(rename = "invite")]
+    pub invites: Vec<Outstanding>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            name: String::new(),
             player: PlayerSetting::default(),
             encoder: crate::capture::AUTO.to_string(),
             silence: vec![crate::capture::DISCORD.to_string()],
             capture: None,
             latency: Latency::Normal,
             friends: Vec::new(),
+            invites: Vec::new(),
         }
     }
 }
@@ -285,8 +310,113 @@ impl Config {
             name: name.to_string(),
             code: id.to_string(),
             auto_open,
+            invite: None,
         });
         Ok(())
+    }
+
+    /// `name`, or `name 2`, `name 3`… if a friend already has it.
+    fn unused_name(&self, name: &str) -> String {
+        let name = match invite::clean_name(name) {
+            name if name.is_empty() => "Friend".to_string(),
+            name => name,
+        };
+        (1..)
+            .map(|n| match n {
+                1 => name.clone(),
+                n => format!("{name} {n}"),
+            })
+            .find(|candidate| !self.friends.iter().any(|f| &f.name == candidate))
+            .expect("some number is free")
+    }
+
+    /// Adds the friend who sent `invite` (as `name`, or the name it carries),
+    /// with its token to show their Kith, which then adds us back. Returns
+    /// the name they're saved as.
+    pub fn join(&mut self, invite: &Invite, name: Option<&str>, own: EndpointId) -> Result<String> {
+        if invite.from == own {
+            bail!("that's your own invite: send it to a friend");
+        }
+        if self.name.trim().is_empty() {
+            bail!(
+                "say what friends should call you first: {}'s Kith saves you under that name",
+                if invite.name.is_empty() {
+                    "your friend"
+                } else {
+                    &invite.name
+                }
+            );
+        }
+        let token = Some(invite.token.to_string());
+        // Added by code already, maybe only on this side: the token fixes that.
+        if let Some(friend) = self
+            .friends
+            .iter_mut()
+            .find(|f| f.id().ok() == Some(invite.from))
+        {
+            friend.invite = token;
+            return Ok(friend.name.clone());
+        }
+        let name = self.unused_name(name.unwrap_or(&invite.name));
+        self.friends.push(Friend {
+            name: name.clone(),
+            code: invite.from.to_string(),
+            auto_open: false,
+            invite: token,
+        });
+        Ok(name)
+    }
+
+    /// Makes an invite for someone to use once, within a week.
+    pub fn invite(&mut self, own: EndpointId) -> Result<Invite> {
+        if self.name.trim().is_empty() {
+            bail!("say what friends should call you first: invites carry your name");
+        }
+        let token = invite::Token::generate()?;
+        self.invites.retain(|outstanding| !outstanding.expired());
+        self.invites.push(Outstanding::new(token));
+        Ok(Invite {
+            from: own,
+            name: invite::clean_name(&self.name),
+            token,
+        })
+    }
+
+    /// Someone used one of our invites: adds them as a friend under the
+    /// name they gave, and spends the invite. True if they're new.
+    ///
+    /// A friend already is fine whatever the token says: that's their Kith
+    /// asking again after missing our answer.
+    pub fn redeem(&mut self, remote: EndpointId, request: &invite::Request) -> Result<bool> {
+        self.invites.retain(|outstanding| !outstanding.expired());
+        let known = self.friends.iter().any(|f| f.id().ok() == Some(remote));
+        let spent = request
+            .token
+            .parse::<invite::Token>()
+            .ok()
+            .and_then(|token| {
+                self.invites
+                    .iter()
+                    .position(|outstanding| outstanding.redeems(&token))
+            });
+        match spent {
+            Some(at) => {
+                self.invites.remove(at);
+            }
+            None if known => return Ok(false),
+            None => bail!("that invite doesn't work anymore (used, or older than a week)"),
+        }
+        if known {
+            return Ok(false);
+        }
+        let name = self.unused_name(&request.name);
+        self.friends.push(Friend {
+            name,
+            code: remote.to_string(),
+            auto_open: false,
+            invite: None,
+        });
+        Ok(true)
     }
 
     pub fn remove_friend(&mut self, name: &str) -> Result<()> {
@@ -332,6 +462,9 @@ pub struct Friend {
     /// Open the player as soon as they go live, instead of notifying.
     #[serde(default)]
     pub auto_open: bool,
+    /// The token of the invite they sent, until their Kith has added us back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite: Option<String>,
 }
 
 impl Friend {

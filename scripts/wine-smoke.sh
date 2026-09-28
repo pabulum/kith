@@ -67,7 +67,17 @@ n=$(frames "$T/win.ts")
 [[ ${n:-0} -gt 150 ]] && pass "Windows build recorded $n frames" \
     || fail "recording: frames=${n:-none} (see $T/win-record.log)"
 
-# 2. `up` serves the control socket as a named pipe.
+# 2. An invite from alice's Linux node, used by the Windows build: the
+#    pairing protocol both ways across the two systems. They're friends by
+#    code already, so this spends the invite without changing either list.
+"$KITH" --home "$T/alice" name Alice >/dev/null
+wine "$EXE" name Win >/dev/null 2>&1
+link=$("$KITH" --home "$T/alice" invite 2>/dev/null)
+joined=$(timeout 60 wine "$EXE" join "$link" 2>/dev/null | tr -d '\r')
+[[ $joined == *"You and alice are friends"* ]] && pass "the Windows build used a Linux invite" \
+    || fail "invite: $joined"
+
+# 3. `up` serves the control socket as a named pipe.
 wine "$EXE" up >"$T/win-up.out" 2>"$T/win-up.log" &
 PIDS+=($!)
 WIN_UP=$!
@@ -90,7 +100,7 @@ kill -0 "$WIN_UP" 2>/dev/null && fail "quit didn't stop the Windows node" \
 kill -TERM "$WIN_UP" 2>/dev/null; wait "$WIN_UP" 2>/dev/null
 wineserver -k 2>/dev/null
 
-# 3. Installing: the program into %LOCALAPPDATA%\Programs\Kith, a Start menu
+# 4. Installing: the program into %LOCALAPPDATA%\Programs\Kith, a Start menu
 #    shortcut, an uninstall entry; and uninstalling takes it all away again.
 U=$WINEPREFIX/drive_c/users/$USER
 timeout 60 wine "$EXE" install >/dev/null 2>&1
@@ -115,7 +125,7 @@ else
 fi
 wineserver -k 2>/dev/null
 
-# 4. --serve, with Linux ffmpeg as the player.
+# 5. --serve, with Linux ffmpeg as the player.
 PORT=$((20000 + RANDOM % 20000))
 wine "$EXE" watch alice --serve "127.0.0.1:$PORT" 2>"$T/win-serve.log" &
 PIDS+=($!)
@@ -128,7 +138,7 @@ else
     fail "--serve never listened (see $T/win-serve.log)"
 fi
 
-# 5. Streaming from Windows: the test pattern through ffmpeg.exe, then the
+# 6. Streaming from Windows: the test pattern through ffmpeg.exe, then the
 # screen path with KITH_SCREEN standing in for Windows' screen capture, which
 # Wine lacks. Wine's sound drivers are off, so the stream's sound is Kith's
 # filled-in silence rather than whatever this machine is playing.
