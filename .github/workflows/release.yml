@@ -1,0 +1,45 @@
+# A version tag (v0.1.0) builds the release with scripts/release.sh, as a
+# local build would, and puts it on GitHub as a draft to look over and
+# publish by hand.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [[ "v$version" == "$GITHUB_REF_NAME" ]] || { echo "::error::Cargo.toml says $version"; exit 1; }
+      - run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add x86_64-pc-windows-gnu
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Install the cross-compilers and packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 libarchive-tools
+          cargo install --locked cargo-zigbuild
+          cargo install --locked cargo-about --features cli
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ffmpeg-windows/out
+          key: ffmpeg-windows-${{ hashFiles('scripts/ffmpeg-windows.sh') }}
+      - run: scripts/release.sh
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --draft --title "Kith ${GITHUB_REF_NAME#v}" --generate-notes

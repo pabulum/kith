@@ -30,11 +30,34 @@ to each friend over an encrypted connection.
 
 ## Install
 
-There are no downloads yet. To build it, [install Rust](https://rustup.rs),
-then:
+Downloads are on the [releases page](https://github.com/pabulum/kith/releases/latest).
+
+- **Windows 10 and 11:** get `kith-<version>-windows-x86_64.zip`, open it,
+  and run `kith.exe`. Windows warns about an app it doesn't recognize,
+  because Kith isn't code-signed: choose **More info**, then **Run anyway**.
+  Kith then offers to install itself.
+- **Linux (x86-64):** get `kith-<version>-linux-x86_64.tar.gz`, unpack it,
+  and run `./kith`, which offers to install itself (or run `./kith install`).
+  It runs on distributions from 2020 on.
+
+To watch, you need nothing else. mpv or VLC plays with the least delay; with
+neither installed, streams open in your web browser.
+
+To stream:
+
+- **Windows:** nothing else. The zip carries `ffmpeg.exe`, built with only
+  what Kith uses (see `FFMPEG-LICENSE.txt` and `FFMPEG-SOURCE.txt`).
+- **Linux:** [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/),
+  from your distribution, or from Flathub (`com.dec05eba.gpu_screen_recorder`)
+  on SteamOS and other systems that install apps that way. The test pattern
+  needs ffmpeg.
+
+### From source
+
+[Install Rust](https://rustup.rs), then:
 
 ```sh
-git clone <this repository>
+git clone https://github.com/pabulum/kith
 cd kith
 cargo build --release
 ```
@@ -43,17 +66,8 @@ The program is `target/release/kith`. To build the Windows one on Linux,
 run `rustup target add x86_64-pc-windows-gnu`, install mingw-w64
 (`mingw-w64-gcc` on Arch), and run
 `cargo build --release --target x86_64-pc-windows-gnu`.
-
-You also need:
-
-- **To watch:** mpv or VLC. With neither, streams open in your web browser,
-  which lags a little more.
-- **To stream (Linux):** [gpu-screen-recorder](https://git.dec05eba.com/gpu-screen-recorder/about/),
-  and ffmpeg for the test pattern.
-- **To stream (Windows):** `ffmpeg.exe` next to `kith.exe`, from one of the
-  Windows builds [ffmpeg.org](https://ffmpeg.org/download.html) links to
-  (ffmpeg 8.0 or later picks a monitor or a window; older ones stream the
-  main screen).
+`scripts/ffmpeg-windows.sh` builds its `ffmpeg.exe` (with Docker), and
+`scripts/release.sh` builds the whole release.
 
 ## Use it
 
@@ -127,7 +141,6 @@ browser and the graphics card, and one that can't says so and links to VLC.
 The settings folder is `~/.config/kith` on Linux and `%APPDATA%\kith`
 on Windows. It holds `config.toml`, your key (`secret.key`) and the log
 (`kith.log`). Besides `player`, `config.toml` has:
-
 - `encoder`: the video encoder for streaming your screen. `"auto"` (the
   default) picks the graphics card and H.264; `kith encoders` lists the
   others your computer has, such as `"hevc"` or `"hevc_10bit"`.
@@ -185,11 +198,15 @@ add your new code.
 
 ```sh
 cargo test               # unit tests
-scripts/smoke.sh         # end to end on one machine: three identities, headless players
+scripts/smoke.sh         # end to end on one machine: several identities, headless players
 scripts/wine-smoke.sh    # the Windows build under Wine, watching a Linux stream
 scripts/wine-smoke.sh path/to/ffmpeg.exe   # ...and streaming from Windows too
-scripts/release.sh       # release archives in dist/, with third-party licenses
+scripts/windows-smoke.sh path/to/ffmpeg.exe  # on real Windows, in Git Bash (CI runs it)
+scripts/ffmpeg-windows.sh  # the trimmed ffmpeg.exe, built in a container
+scripts/release.sh       # the release in dist/, with third-party licenses
 ```
+
+A tag like `v0.1.0` builds the release on GitHub and drafts it there.
 
 ## License
 
