@@ -1,12 +1,22 @@
-//! gpu-screen-recorder, which records the screen on Linux.
+//! gpu-screen-recorder, which records the screen on Linux: installed, or
+//! else its Flatpak, which is how SteamOS and other immutable systems get it.
 
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 use super::{Backend, Codec, Device, Encoder, Recorder};
 
 const PROGRAM: &str = "gpu-screen-recorder";
+
+/// gpu-screen-recorder from Flathub. Portal capture and app audio work from
+/// inside its sandbox, and `flatpak run` passes the stream through stdout.
+const FLATPAK: [&str; 4] = [
+    "flatpak",
+    "run",
+    "--command=gpu-screen-recorder",
+    "com.dec05eba.gpu_screen_recorder",
+];
 
 /// What [`AUTO`](super::AUTO) picks from, in order. The graphics card comes
 /// before the processor, and H.264 before HEVC, because a friend with no video
@@ -20,12 +30,19 @@ const DISCORD_VOICE: &str = "WEBRTC VoiceEngine";
 // Windows test builds compile this module for its tests, but record with ffmpeg.
 #[cfg_attr(windows, allow(dead_code))]
 pub(super) fn detect() -> Result<Recorder> {
-    let output = Command::new(PROGRAM)
-        .arg("--info")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|err| crate::node::spawn_error(PROGRAM, "capture", err))?;
+    let (output, flatpak) = match info(&[PROGRAM]) {
+        Ok(output) => (output, false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => match info(&FLATPAK) {
+            Ok(output) if output.status.success() => (output, true),
+            _ => {
+                return Err(anyhow!(
+                    "{PROGRAM} (the screen recorder) isn't installed: get it from your \
+                     distribution, or from Flathub (com.dec05eba.gpu_screen_recorder)"
+                ));
+            }
+        },
+        Err(err) => return Err(crate::node::spawn_error(PROGRAM, "capture", err)),
+    };
     if !output.status.success() {
         bail!(
             "`{PROGRAM} --info` failed ({}), so Kith can't tell which encoders work \
@@ -33,7 +50,19 @@ pub(super) fn detect() -> Result<Recorder> {
             output.status
         );
     }
-    Ok(parse(&String::from_utf8_lossy(&output.stdout)))
+    let mut recorder = parse(&String::from_utf8_lossy(&output.stdout));
+    recorder.backend = Backend::Gsr { flatpak };
+    Ok(recorder)
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn info(launcher: &[&str]) -> std::io::Result<Output> {
+    Command::new(launcher[0])
+        .args(&launcher[1..])
+        .arg("--info")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
 }
 
 /// Reads `--info`: the graphics card's maker, whether it can record apps
@@ -69,7 +98,7 @@ pub(super) fn parse(info: &str) -> Recorder {
     Recorder {
         encoders,
         can_silence,
-        backend: Backend::Gsr,
+        backend: Backend::Gsr { flatpak: false },
     }
 }
 
@@ -113,7 +142,7 @@ fn encoder(name: &str, maker: &Option<String>) -> Option<Encoder> {
 /// MoQ group one second long, which bounds how long a joining or skipping
 /// viewer waits for a keyframe, at some bitrate cost. AAC because every player
 /// plays it, the browser page included.
-pub(super) fn command(encoder: &Encoder, silence: &[String]) -> Vec<String> {
+pub(super) fn command(encoder: &Encoder, silence: &[String], flatpak: bool) -> Vec<String> {
     let cpu = encoder.device == Device::Cpu;
     // Processor encoding is `-k h264 -encoder cpu`, not a codec name of its own.
     let codec = match encoder.name.strip_suffix("_software") {
@@ -121,8 +150,9 @@ pub(super) fn command(encoder: &Encoder, silence: &[String]) -> Vec<String> {
         _ => &encoder.name,
     };
     let audio = audio(silence);
-    let mut argv = vec![
-        PROGRAM,
+    let launcher: &[&str] = if flatpak { &FLATPAK } else { &[PROGRAM] };
+    let mut argv = launcher.to_vec();
+    argv.extend([
         "-w",
         "portal",
         "-restore-portal-session",
@@ -131,7 +161,7 @@ pub(super) fn command(encoder: &Encoder, silence: &[String]) -> Vec<String> {
         "mpegts",
         "-k",
         codec,
-    ];
+    ]);
     if cpu {
         argv.extend(["-encoder", "cpu"]);
     }
@@ -246,7 +276,7 @@ mod tests {
     #[test]
     fn commands_select_the_encoder() {
         let recorder = parse(AMD_INFO);
-        let argv = |name: &str| command(recorder.choose(name).unwrap(), &[]);
+        let argv = |name: &str| command(recorder.choose(name).unwrap(), &[], false);
         assert_eq!(flag(&argv("hevc"), "-k").as_deref(), Some("hevc"));
         assert_eq!(flag(&argv("hevc"), "-encoder"), None);
         assert_eq!(flag(&argv("h264_software"), "-k").as_deref(), Some("h264"));
@@ -258,6 +288,17 @@ mod tests {
             flag(&argv("hevc_10bit_vulkan"), "-k").as_deref(),
             Some("hevc_10bit_vulkan")
         );
+    }
+
+    #[test]
+    fn the_flatpak_records_the_same_way() {
+        let recorder = parse(AMD_INFO);
+        let h264 = recorder.choose("h264").unwrap();
+        let installed = command(h264, &[], false);
+        let flatpak = command(h264, &[], true);
+        assert_eq!(installed[0], "gpu-screen-recorder");
+        assert_eq!(flatpak[..4], FLATPAK);
+        assert_eq!(installed[1..], flatpak[4..]);
     }
 
     #[test]

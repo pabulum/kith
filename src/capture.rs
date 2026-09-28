@@ -126,7 +126,10 @@ pub struct Recorder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Backend {
     #[cfg(any(not(windows), test))]
-    Gsr,
+    Gsr {
+        /// Recording through its Flatpak.
+        flatpak: bool,
+    },
     #[cfg(any(windows, test))]
     Ffmpeg {
         /// The build can scale on the graphics card.
@@ -165,7 +168,7 @@ impl Recorder {
         if setting == AUTO {
             let order: &[&str] = match self.backend {
                 #[cfg(any(not(windows), test))]
-                Backend::Gsr => &gsr::AUTO_ORDER,
+                Backend::Gsr { .. } => &gsr::AUTO_ORDER,
                 #[cfg(any(windows, test))]
                 Backend::Ffmpeg { .. } => &ffmpeg::AUTO_ORDER,
             };
@@ -192,7 +195,7 @@ impl Recorder {
     pub fn can_pick(&self) -> bool {
         match self.backend {
             #[cfg(any(not(windows), test))]
-            Backend::Gsr => false,
+            Backend::Gsr { .. } => false,
             #[cfg(any(windows, test))]
             Backend::Ffmpeg { gfxcapture, .. } => gfxcapture,
         }
@@ -210,8 +213,8 @@ impl Recorder {
         let silence = if self.can_silence { silence } else { &[] };
         match self.backend {
             #[cfg(any(not(windows), test))]
-            Backend::Gsr => Recording {
-                argv: gsr::command(encoder, silence),
+            Backend::Gsr { flatpak } => Recording {
+                argv: gsr::command(encoder, silence, flatpak),
                 sound: None,
             },
             #[cfg(any(windows, test))]
