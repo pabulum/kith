@@ -18,7 +18,8 @@ KITH=./target/debug/kith
 EXE=./target/x86_64-pc-windows-gnu/debug/kith.exe
 
 T=$(mktemp -d -t kith-wine.XXXX)
-export WINEPREFIX=$T/wine WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" NO_COLOR=1
+# winemenubuilder would copy the prefix's Start menu into this machine's app menu.
+export WINEPREFIX=$T/wine WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d" NO_COLOR=1
 # Headless: nothing here opens a window, and Wine skips its setup dialogs.
 unset DISPLAY WAYLAND_DISPLAY
 PIDS=()
@@ -59,7 +60,9 @@ wait_for "$T/alice.out" 'Kith is up' 20 || fail "alice's node didn't start"
 "$KITH" --home "$T/alice" live --source test >/dev/null
 
 # 1. Record over iroh+MoQ into a file (a Z: path is the Linux filesystem).
-timeout 15 wine "$EXE" watch alice --output "Z:${T//\//\\}\\win.ts" 2>"$T/win-record.log"
+#    The first network use in a fresh prefix starts Wine's networking services,
+#    which can take ten seconds, so this allows for them.
+timeout 25 wine "$EXE" watch alice --output "Z:${T//\//\\}\\win.ts" 2>"$T/win-record.log"
 n=$(frames "$T/win.ts")
 [[ ${n:-0} -gt 150 ]] && pass "Windows build recorded $n frames" \
     || fail "recording: frames=${n:-none} (see $T/win-record.log)"
@@ -87,7 +90,32 @@ kill -0 "$WIN_UP" 2>/dev/null && fail "quit didn't stop the Windows node" \
 kill -TERM "$WIN_UP" 2>/dev/null; wait "$WIN_UP" 2>/dev/null
 wineserver -k 2>/dev/null
 
-# 3. --serve, with Linux ffmpeg as the player.
+# 3. Installing: the program into %LOCALAPPDATA%\Programs\Kith, a Start menu
+#    shortcut, an uninstall entry; and uninstalling takes it all away again.
+U=$WINEPREFIX/drive_c/users/$USER
+timeout 60 wine "$EXE" install >/dev/null 2>&1
+INSTALLED=$U/AppData/Local/Programs/Kith/kith.exe
+LINK="$U/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Kith.lnk"
+entry=$(wine reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kith' 2>/dev/null | tr -d '\r')
+if [[ -f $INSTALLED && -f $LINK && $entry == *'kith.exe" "uninstall"'* ]] \
+    && [[ $(timeout 60 wine "$INSTALLED" --version 2>/dev/null | tr -d '\r') == "kith "* ]]; then
+    pass "install: program, Start menu shortcut and uninstall entry"
+else
+    fail "install: program=$([[ -f $INSTALLED ]] && echo yes) shortcut=$([[ -f $LINK ]] && echo yes) entry=$entry"
+fi
+timeout 60 wine "$INSTALLED" uninstall >/dev/null 2>&1
+# The folder goes a few seconds after the uninstaller (running from it) exits.
+deadline=$((SECONDS + 20))
+while [[ -e $INSTALLED ]] && ((SECONDS < deadline)); do sleep 0.5; done
+if [[ ! -e $INSTALLED && ! -e $LINK ]] \
+    && ! wine reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kith' >/dev/null 2>&1; then
+    pass "uninstall removed the program, the shortcut and the entry"
+else
+    fail "uninstall left: program=$([[ -e $INSTALLED ]] && echo yes) shortcut=$([[ -e $LINK ]] && echo yes)"
+fi
+wineserver -k 2>/dev/null
+
+# 4. --serve, with Linux ffmpeg as the player.
 PORT=$((20000 + RANDOM % 20000))
 wine "$EXE" watch alice --serve "127.0.0.1:$PORT" 2>"$T/win-serve.log" &
 PIDS+=($!)
@@ -100,7 +128,7 @@ else
     fail "--serve never listened (see $T/win-serve.log)"
 fi
 
-# 4. Streaming from Windows: the test pattern through ffmpeg.exe, then the
+# 5. Streaming from Windows: the test pattern through ffmpeg.exe, then the
 # screen path with KITH_SCREEN standing in for Windows' screen capture, which
 # Wine lacks. Wine's sound drivers are off, so the stream's sound is Kith's
 # filled-in silence rather than whatever this machine is playing.
@@ -109,7 +137,7 @@ if [[ -n $WIN_FFMPEG ]]; then
     wineserver -k 2>/dev/null
     APP=$T/app
     mkdir -p "$APP" && cp "$EXE" "$APP/" && ln -s "$(realpath "$WIN_FFMPEG")" "$APP/ffmpeg.exe"
-    export WINEDLLOVERRIDES="mscoree,mshtml,winepulse.drv,winealsa.drv="
+    export WINEDLLOVERRIDES="mscoree,mshtml,winepulse.drv,winealsa.drv=;winemenubuilder.exe=d"
     why=$(timeout 120 wine "$APP/kith.exe" encoders 2>&1 | tr -d '\r')
     [[ $why == *"wouldn't let ffmpeg capture the screen"* ]] \
         && pass "without screen capture, encoders says why" || fail "encoders: $why"

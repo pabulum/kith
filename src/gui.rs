@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -46,7 +47,9 @@ pub struct Start {
     pub link: Option<Link>,
 }
 
-pub fn run(runtime: Runtime, home: Home, start: Start) -> Result<()> {
+/// Runs the app until it quits. Returns a program to start then: the
+/// installed Kith, when this one just installed it.
+pub fn run(runtime: Runtime, home: Home, start: Start) -> Result<Option<PathBuf>> {
     #[cfg(windows)]
     register(&home);
     let shared = Shared::default();
@@ -78,7 +81,7 @@ pub fn run(runtime: Runtime, home: Home, start: Start) -> Result<()> {
         runtime.block_on(node.shutdown());
     }
     runtime.shutdown_timeout(Duration::from_secs(2));
-    result
+    result.map(|()| window.state().then.take())
 }
 
 /// Why closing the window leaves Kith running.
@@ -205,6 +208,8 @@ struct WindowState {
     /// Asked to open while closed.
     open: bool,
     quit: bool,
+    /// What to start once quit: the installed Kith.
+    then: Option<PathBuf>,
 }
 
 impl AppWindow {
@@ -239,6 +244,12 @@ impl AppWindow {
 
     fn quitting(&self) -> bool {
         self.state().quit
+    }
+
+    /// Quits, and hands over to `program` once this Kith is gone.
+    fn quit_into(&self, program: PathBuf) {
+        self.state().then = Some(program);
+        self.quit();
     }
 
     /// The window is up: from now on it's raised, not reopened.
@@ -350,6 +361,8 @@ struct Inner {
     opening: HashSet<String>,
     /// What the screen recorder can do here, once it has said.
     recorder: Option<Result<Recorder, String>>,
+    /// Install or Update was put off until next time.
+    install_later: bool,
     /// The stream failure last put in the message bar, so it shows once,
     /// even when it happened with the window closed.
     shown_stream_error: Option<String>,
@@ -422,6 +435,12 @@ struct App {
     stays: Stays,
     /// Kith starts at login.
     autostart: bool,
+    /// Installing, when this isn't the installed Kith.
+    offer: Option<install::Offer>,
+    /// Kith is installed, so it can be uninstalled.
+    installed: bool,
+    /// Uninstall was clicked once and awaits confirmation.
+    uninstalling: bool,
     /// The add-a-friend form.
     name: String,
     code: String,
@@ -476,6 +495,9 @@ impl App {
             window,
             stays,
             autostart: install::autostart(),
+            offer: install::offer(),
+            installed: install::installed().is_some(),
+            uninstalling: false,
             name: String::new(),
             code: String::new(),
             auto_open: false,
@@ -505,6 +527,7 @@ impl App {
                 .say(Message::Problem(format!("Your stream stopped: {err}")));
         }
 
+        self.install_banner(ui);
         if self.browser_fallback() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -555,6 +578,58 @@ impl App {
         self.settings(ui);
     }
 
+    /// Offers to install this Kith, or to update the installed one to it.
+    fn install_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(offer) = self.offer else { return };
+        if self.shared.0.lock().unwrap().install_later {
+            return;
+        }
+        let place = if cfg!(windows) {
+            "the Start menu"
+        } else {
+            "your app menu"
+        };
+        let (text, button) = match offer {
+            install::Offer::Install => (
+                format!("Install Kith? It goes in {place}, so it's easy to find again."),
+                "Install",
+            ),
+            install::Offer::Update(Some(old)) => (
+                format!(
+                    "Kith {old} is installed. Update it to {}?",
+                    install::version()
+                ),
+                "Update",
+            ),
+            install::Offer::Update(None) => (
+                format!(
+                    "An older Kith is installed. Update it to {}?",
+                    install::version()
+                ),
+                "Update",
+            ),
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(text);
+            if ui.button(RichText::new(button).strong()).clicked() {
+                match install::install(&self.home) {
+                    Ok(installed) => {
+                        self.shared
+                            .say(Message::Info("Installed. Opening it…".to_string()));
+                        self.window.quit_into(installed);
+                    }
+                    Err(err) => self
+                        .shared
+                        .say(Message::Problem(format!("Installing Kith: {err:#}"))),
+                }
+            }
+            if ui.button("Not now").clicked() {
+                self.shared.0.lock().unwrap().install_later = true;
+            }
+        });
+        ui.separator();
+    }
+
     fn settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         let mut autostart = self.autostart;
@@ -582,13 +657,48 @@ impl App {
                 Err(err) => self.shared.say(Message::Problem(format!("{err:#}"))),
             }
         }
-        if ui
-            .button("Quit Kith")
-            .on_hover_text("Friends can't reach you until you open Kith again.")
-            .clicked()
-        {
-            self.window.quit();
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Quit Kith")
+                .on_hover_text("Friends can't reach you until you open Kith again.")
+                .clicked()
+            {
+                self.window.quit();
+            }
+            if !self.installed {
+                return;
+            }
+            if !self.uninstalling {
+                if ui
+                    .button("Uninstall…")
+                    .on_hover_text("Your code and friends stay, for if you install Kith again.")
+                    .clicked()
+                {
+                    self.uninstalling = true;
+                }
+                return;
+            }
+            ui.label("Uninstall Kith?");
+            if ui.small_button("Yes").clicked() {
+                match install::uninstall() {
+                    Ok(_) => {
+                        let body = format!(
+                            "Your code and friends stay in {}.",
+                            self.home.dir().display()
+                        );
+                        self.runtime
+                            .spawn(async move { notify::tell("Kith is uninstalled", &body).await });
+                        self.window.quit();
+                    }
+                    Err(err) => self
+                        .shared
+                        .say(Message::Problem(format!("Uninstalling Kith: {err:#}"))),
+                }
+            }
+            if ui.small_button("No").clicked() {
+                self.uninstalling = false;
+            }
+        });
     }
 
     fn streaming(&mut self, ui: &mut egui::Ui, node: &Node, live: bool) {

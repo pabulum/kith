@@ -95,6 +95,12 @@ enum Command {
     Open { link: Option<String> },
     /// Quit the running Kith: its window, tray icon and connections.
     Quit,
+    /// Install this Kith for you: the Start menu (or app menu), and kith://
+    /// links. Updates an older one.
+    Install,
+    /// Remove what `install` added, and starting at login. Your code, friends
+    /// and settings stay.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -153,23 +159,35 @@ fn app(
         }
     };
     // One Kith per identity: opening it again hands over to the one running,
-    // which shows its window or follows the link.
+    // which shows its window or follows the link. A newer Kith than that one
+    // (one just downloaded, say) takes over instead, to offer an update.
+    let socket = home.socket_path();
     #[cfg(windows)]
     let_it_take_focus();
-    let request = if background {
-        Request::Status
-    } else {
-        Request::Open {
-            link: link.as_ref().map(ToString::to_string),
-        }
-    };
-    if let Some(response) = runtime.block_on(control::send(&home.socket_path(), &request))? {
-        if response.ok || background {
+    if let Some(running) = runtime.block_on(running(&socket))? {
+        if background {
             return Ok(());
         }
-        #[cfg(windows)]
-        message_box(&response.message);
-        bail!("{}", response.message);
+        let newer = running
+            .version
+            .is_none_or(|theirs| theirs < install::version());
+        if newer && !running.live {
+            runtime.block_on(take_over(&socket))?;
+        } else {
+            let request = Request::Open {
+                link: link.as_ref().map(ToString::to_string),
+            };
+            match runtime.block_on(control::send(&socket, &request))? {
+                Some(response) if response.ok => return Ok(()),
+                Some(response) => {
+                    #[cfg(windows)]
+                    message_box(&response.message);
+                    bail!("{}", response.message);
+                }
+                // It quit in the meantime.
+                None => {}
+            }
+        }
     }
 
     // A window has no terminal to read on Windows, so the log also goes to a
@@ -187,11 +205,17 @@ fn app(
     }));
 
     let start = gui::Start { background, link };
+    let args = home.args();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gui::run(runtime, home, start)
     }))
     .unwrap_or_else(|_| Err(anyhow::anyhow!("Kith crashed")));
-    let Err(err) = result else { return Ok(()) };
+    let err = match result {
+        Ok(None) => return Ok(()),
+        // Kith was just installed: the installed copy takes over from here.
+        Ok(Some(installed)) => return start_detached(&installed, &args),
+        Err(err) => err,
+    };
     tracing::error!("{err:#}");
     // Most window failures are the GPU driver refusing DX12 or Vulkan, and
     // OpenGL often works where they don't. winit can't open a second event
@@ -225,18 +249,101 @@ fn app(
 /// screen when the window fails to open.
 #[cfg(windows)]
 fn message_box(text: &str) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    message_box_with(text, true);
+}
+
+#[cfg(windows)]
+fn message_box_with(text: &str, error: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK};
+    let icon = if error {
+        MB_ICONERROR
+    } else {
+        MB_ICONINFORMATION
+    };
+    dialog(text, MB_OK | icon);
+}
+
+/// Whether printing goes anywhere: to the terminal Kith was started from, or
+/// a pipe. Started from Windows' Apps list, it goes nowhere.
+#[cfg(windows)]
+fn has_console() -> bool {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Console::{GetStdHandle, STD_OUTPUT_HANDLE},
+    };
+    // SAFETY: takes a constant, and returns a handle, null, or invalid.
+    let out = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    !out.is_null() && out != INVALID_HANDLE_VALUE
+}
+
+/// Asks a yes-or-no question in a dialog; true for yes.
+#[cfg(windows)]
+fn ask(text: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONQUESTION, MB_YESNO};
+    dialog(text, MB_YESNO | MB_ICONQUESTION) == IDYES
+}
+
+#[cfg(windows)]
+fn dialog(text: &str, style: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
     let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
     let (text, title) = (wide(text), wide("Kith"));
     // SAFETY: both strings are NUL-terminated and outlive the call.
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONERROR,
-        )
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), style) }
+}
+
+/// A Kith running for this home: its version (`None` when it's too old to
+/// say) and whether it's streaming.
+#[cfg(not(target_os = "android"))]
+struct Running {
+    version: Option<install::Version>,
+    live: bool,
+}
+
+#[cfg(not(target_os = "android"))]
+async fn running(socket: &std::path::Path) -> Result<Option<Running>> {
+    let Some(status) = control::send(socket, &Request::Status).await? else {
+        return Ok(None);
     };
+    let version = match control::send(socket, &Request::Version).await {
+        Ok(Some(reply)) if reply.ok => reply.message.parse().ok(),
+        _ => None,
+    };
+    Ok(Some(Running {
+        version,
+        live: status.message.lines().any(|line| line == "live: yes"),
+    }))
+}
+
+/// Asks the running Kith to quit, and waits until it has.
+#[cfg(not(target_os = "android"))]
+async fn take_over(socket: &std::path::Path) -> Result<()> {
+    control::send(socket, &Request::Quit).await?;
+    for _ in 0..50 {
+        if control::send(socket, &Request::Status).await?.is_none() {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    bail!("the Kith already running didn't quit; quit it from its tray icon, then try again")
+}
+
+/// Starts `program` on its own, to outlive this process.
+#[cfg(not(target_os = "android"))]
+fn start_detached(program: &std::path::Path, args: &[String]) -> Result<()> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Out of the terminal's process group, so closing that doesn't close Kith.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command
+        .spawn()
+        .with_context(|| format!("starting {}", program.display()))?;
+    Ok(())
 }
 
 /// Lets the Kith already running bring its window to the front, which Windows
@@ -367,7 +474,56 @@ async fn run(home: Home, command: Command) -> Result<()> {
             Some(response) => report(response)?,
             None => println!("Kith isn't running"),
         },
+        #[cfg(not(target_os = "android"))]
+        Command::Install => {
+            let installed = install::install(&home)?;
+            println!(
+                "Installed Kith {} as {}",
+                install::version(),
+                installed.display()
+            );
+            if control::send(&socket, &Request::Status).await?.is_some() {
+                println!("The Kith running now is the old one: `kith quit`, then open Kith again.");
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        Command::Uninstall => uninstall(&socket).await?,
+        #[cfg(target_os = "android")]
+        Command::Install | Command::Uninstall => bail!("there's nothing to install on Android"),
         Command::Open { .. } => unreachable!("main opens the app"),
+    }
+    Ok(())
+}
+
+/// `kith uninstall`, which Windows' Apps list runs too, with no console to
+/// answer in: then it asks and reports in dialogs.
+#[cfg(not(target_os = "android"))]
+async fn uninstall(socket: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    let dialogs = !has_console();
+    #[cfg(windows)]
+    if dialogs
+        && !ask(
+            "Uninstall Kith?\n\nYour code and friends stay on this PC, so Kith \
+             remembers them if you install it again.",
+        )
+    {
+        return Ok(());
+    }
+    // A Kith still running would put the tray icon and links back.
+    if control::send(socket, &Request::Status).await?.is_some() {
+        take_over(socket).await?;
+    }
+    let removed = install::uninstall()?;
+    let report = if removed.is_empty() {
+        "Kith wasn't installed.".to_string()
+    } else {
+        format!("Removed {}.", removed.join(", "))
+    };
+    println!("{report}");
+    #[cfg(windows)]
+    if dialogs {
+        message_box_with(&format!("Kith is uninstalled. {report}"), false);
     }
     Ok(())
 }

@@ -60,7 +60,10 @@ You also need:
 ### The app
 
 Run `kith` with no arguments (on Windows, double-click `kith.exe`).
-The window shows your code, your friends, and who's live.
+The window shows your code, your friends, and who's live. The first time,
+it offers to **Install** itself: into the Start menu on Windows (Settings →
+Apps removes it again), or your app menu on Linux. Opening a newer Kith
+later offers to **Update** the installed one.
 
 1. **Copy** your code and send it to a friend. Put theirs in **Add a friend**.
 2. When a friend goes live, a notification says so, with a **Watch**
@@ -96,6 +99,8 @@ kith watch sam [--latency low|normal|smooth]
 kith watch sam --serve 127.0.0.1:8080 # for a player you open yourself, at that URL
 kith status                           # who's online or live, and whether it's direct or relayed
 kith quit                             # stop Kith: the window, the tray icon, or `kith up`
+kith install                          # into the Start menu or app menu (~/.local/bin on Linux)
+kith uninstall                        # ...and out again; your code and friends stay
 ```
 
 While Kith runs (the app, or `kith up`), the other commands go through it.

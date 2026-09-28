@@ -301,6 +301,29 @@ else
 fi
 kith alice live --stop >/dev/null
 
+# 11. Installing for this user: the program in ~/.local/bin, an app menu
+#     entry that opens kith:// links, and the icon; uninstalling removes them.
+#     A throwaway $HOME stands in for the real one.
+F=$T/installhome
+mkdir -p "$F"
+as_user() { env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$F" "$@"; }
+as_user "$KITH" install >/dev/null
+entry=$F/.local/share/applications/kith.desktop
+if [[ -x $F/.local/bin/kith ]] && grep -qx 'MimeType=x-scheme-handler/kith;' "$entry" \
+    && grep -qxF "Exec=$F/.local/bin/kith open %u" "$entry" \
+    && [[ -f $F/.local/share/icons/hicolor/48x48/apps/kith.png ]] \
+    && [[ $(as_user "$F/.local/bin/kith" --version) == "kith "* ]]; then
+    pass "install: program, app menu entry for kith:// links, and icon"
+else
+    fail "install (see $entry)"
+fi
+as_user "$KITH" uninstall >/dev/null
+if [[ ! -e $F/.local/bin/kith && ! -e $entry && ! -e $F/.local/share/icons/hicolor/48x48/apps/kith.png ]]; then
+    pass "uninstall removed them"
+else
+    fail "uninstall left files in $F"
+fi
+
 if ((FAILED)); then
     echo "logs kept in $T"
     exit 1

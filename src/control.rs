@@ -39,6 +39,8 @@ pub enum Request {
     },
     /// Quit: the window, the tray icon and the node.
     Quit,
+    /// Which version of Kith is running, so a newer one can take over.
+    Version,
 }
 
 /// What the control socket can ask of the app, when Kith runs as one.
@@ -139,6 +141,7 @@ async fn handle(
             }
             Ok("Kith is quitting".to_string())
         }
+        Request::Version => Ok(env!("CARGO_PKG_VERSION").to_string()),
     };
     let response = match result {
         Ok(message) => Response { ok: true, message },
