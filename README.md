@@ -6,15 +6,17 @@ Stream your screen to your friends, peer to peer. There are no accounts and
 no servers of ours, and quality isn't a paid tier: your stream goes straight
 to each friend over an encrypted connection.
 
-> **Early days.** It works, but it has been tested on few machines, and on
-> Windows only under Wine so far. Expect rough edges.
+> **Early days.** It works, but it has run on few machines. On Windows, CI
+> streams between two copies, installs, and shows a notification on a cloud
+> machine, but nobody has streamed a real screen with a graphics card yet.
+> Expect rough edges.
 
 ## How it works
 
 - **Your code is your identity.** Kith makes a key pair the first time it
-  runs, and your code is the public half. Send yours to a friend and add
-  theirs. Kith only connects people who have added each other, so nobody
-  else can put a stream on your screen.
+  runs, and your code is the public half. Kith only connects people who have
+  added each other's codes, so nobody else can put a stream on your screen.
+  An invite link does that adding for both of you at once.
 - **Going live tells your friends.** Friends with Kith open get a
   notification, or their player opens by itself if they asked for that.
 - **The video goes straight to them** when your networks allow a direct
@@ -25,7 +27,7 @@ to each friend over an encrypted connection.
 | | Watch | Stream |
 | --- | --- | --- |
 | Linux | yes | yes, through the desktop's screen-sharing portal |
-| Windows 10 and 11 | yes | a monitor or a window, through ffmpeg; not yet tried on a real PC |
+| Windows 10 and 11 | yes | a monitor or a window; not yet tried with a graphics card |
 | Android | command line only; builds, untested | no |
 
 ## Install
