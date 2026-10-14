@@ -111,6 +111,17 @@ pub fn offer() -> Option<Offer> {
     }
 }
 
+/// Why this program can't install, if it can't: on Windows, a release run
+/// from inside its zip, without the ffmpeg.exe it streams with.
+pub fn incomplete() -> Option<&'static str> {
+    #[cfg(windows)]
+    return std::env::current_exe()
+        .ok()
+        .and_then(|exe| system::incomplete(&exe));
+    #[allow(unreachable_code)]
+    None
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,

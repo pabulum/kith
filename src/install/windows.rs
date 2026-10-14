@@ -67,9 +67,27 @@ pub fn installed() -> Option<Installed> {
     Some(Installed { exe, version })
 }
 
+/// Why `exe` can't install, if it can't: a release's kith.exe with no
+/// ffmpeg.exe beside it, which is how Windows runs it from inside the zip,
+/// and none installed already. Installed like that, Kith couldn't stream.
+pub fn incomplete(exe: &Path) -> Option<&'static str> {
+    let has_ffmpeg = |dir: Option<PathBuf>| dir.is_some_and(|dir| dir.join("ffmpeg.exe").is_file());
+    let release = option_env!("KITH_RELEASE_BUILD").is_some();
+    if !release || has_ffmpeg(exe.parent().map(Path::to_path_buf)) || has_ffmpeg(install_dir()) {
+        return None;
+    }
+    Some(
+        "extract the zip first (right-click it, then Extract All), and run kith.exe from the \
+         folder that makes: run from inside the zip, Kith has no ffmpeg.exe to stream with",
+    )
+}
+
 /// Copies Kith's folder into place, adds the Start menu shortcut and the
 /// uninstall entry, and points `kith://` links at the installed program.
 pub fn install(exe: &Path, home_args: &[String]) -> Result<PathBuf> {
+    if let Some(why) = incomplete(exe) {
+        bail!("{why}");
+    }
     let dir = install_dir().context("%LOCALAPPDATA% is not set")?;
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let source = exe.parent().context("finding Kith's own folder")?;

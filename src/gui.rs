@@ -466,6 +466,8 @@ struct App {
     autostart: bool,
     /// Installing, when this isn't the installed Kith.
     offer: Option<install::Offer>,
+    /// Why installing can't work from here, if it can't.
+    incomplete: Option<&'static str>,
     /// Kith is installed, so it can be uninstalled.
     installed: bool,
     /// The `updates` setting: Kith updates itself.
@@ -532,6 +534,7 @@ impl App {
             stays,
             autostart: install::autostart(),
             offer: install::offer(),
+            incomplete: install::incomplete(),
             installed: install::installed().is_some(),
             keep_updated,
             uninstalling: false,
@@ -645,17 +648,21 @@ impl App {
             ),
         };
         ui.horizontal_wrapped(|ui| {
-            ui.label(text);
-            if ui.button(RichText::new(button).strong()).clicked() {
-                match install::install(&self.home) {
-                    Ok(installed) => {
-                        self.shared
-                            .say(Message::Info("Installed. Opening it…".to_string()));
-                        self.window.quit_into(installed);
+            if let Some(why) = self.incomplete {
+                ui.label(format!("To install Kith, {why}."));
+            } else {
+                ui.label(text);
+                if ui.button(RichText::new(button).strong()).clicked() {
+                    match install::install(&self.home) {
+                        Ok(installed) => {
+                            self.shared
+                                .say(Message::Info("Installed. Opening it…".to_string()));
+                            self.window.quit_into(installed);
+                        }
+                        Err(err) => self
+                            .shared
+                            .say(Message::Problem(format!("Installing Kith: {err:#}"))),
                     }
-                    Err(err) => self
-                        .shared
-                        .say(Message::Problem(format!("Installing Kith: {err:#}"))),
                 }
             }
             if ui.button("Not now").clicked() {

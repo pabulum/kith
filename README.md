@@ -34,10 +34,12 @@ to each friend over an encrypted connection.
 
 Downloads are on the [releases page](https://github.com/pabulum/kith/releases/latest).
 
-- **Windows 10 and 11:** get `kith-<version>-windows-x86_64.zip`, open it,
-  and run `kith.exe`. Windows warns about an app it doesn't recognize,
-  because Kith isn't code-signed: choose **More info**, then **Run anyway**.
-  Kith then offers to install itself.
+- **Windows 10 and 11:** get `kith-<version>-windows-x86_64.zip`,
+  right-click it, choose **Extract All**, and run `kith.exe` in the folder
+  that makes. (Run straight from the zip, Windows leaves behind the
+  `ffmpeg.exe` Kith streams with.) Windows warns about an app it doesn't
+  recognize, because Kith isn't code-signed: choose **More info**, then
+  **Run anyway**. Kith then offers to install itself.
 - **Linux (x86-64):** get `kith-<version>-linux-x86_64.tar.gz`, unpack it,
   and run `./kith`, which offers to install itself (or run `./kith install`).
   It runs on distributions from 2020 on.
