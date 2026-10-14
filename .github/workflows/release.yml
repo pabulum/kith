@@ -1,6 +1,7 @@
 # A version tag (v0.1.0) builds the release with scripts/release.sh, as a
-# local build would, and puts it on GitHub as a draft to look over and
-# publish by hand.
+# local build would, and puts it on GitHub as a draft to look over.
+# scripts/publish.sh then signs it for Kith's updater, with a key that isn't
+# on GitHub, and publishes it.
 name: Release
 
 on:

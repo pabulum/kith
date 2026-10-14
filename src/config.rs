@@ -201,6 +201,8 @@ const CONFIG_HEADER: &str = "\
 #          writing MPEG-TS (H.264/HEVC video, AAC audio) to stdout. `encoder`
 #          and `silence` don't apply to it.
 # latency: default for watching: low | normal | smooth.
+# updates: false stops Kith looking on GitHub for a new version every few
+#          hours and installing it when it next starts.
 # [[invite]]: invites you've made that nobody has used yet. Each works once,
 #          within a week.";
 
@@ -215,10 +217,18 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<Vec<String>>,
     pub latency: Latency,
+    /// Kith updates itself. Written out only when off, because an older Kith
+    /// refuses a config.toml with settings it doesn't know.
+    #[serde(skip_serializing_if = "is_true")]
+    pub updates: bool,
     #[serde(rename = "friend")]
     pub friends: Vec<Friend>,
     #[serde(rename = "invite")]
     pub invites: Vec<Outstanding>,
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl Default for Config {
@@ -230,6 +240,7 @@ impl Default for Config {
             silence: vec![crate::capture::DISCORD.to_string()],
             capture: None,
             latency: Latency::Normal,
+            updates: true,
             friends: Vec::new(),
             invites: Vec::new(),
         }
@@ -524,5 +535,17 @@ mod tests {
         assert!(!text.contains("capture"), "{text}");
         assert!(text.contains(r#"encoder = "auto""#), "{text}");
         assert!(text.contains(r#"silence = ["Discord"]"#), "{text}");
+    }
+
+    #[test]
+    fn updates_are_written_only_when_off() {
+        let on = Config::default();
+        assert!(on.updates);
+        assert!(!toml::to_string_pretty(&on).unwrap().contains("updates"));
+        let off = Config::parse("updates = false").unwrap();
+        assert!(!off.updates);
+        let text = toml::to_string_pretty(&off).unwrap();
+        assert!(text.contains("updates = false"), "{text}");
+        assert!(Config::parse(&text).is_ok_and(|config| !config.updates));
     }
 }

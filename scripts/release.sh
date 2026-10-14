@@ -35,6 +35,8 @@ ffmpeg=target/ffmpeg-windows/out
 export RUSTFLAGS="--remap-path-prefix=$HOME=~"
 export CFLAGS="-ffile-prefix-map=$HOME=~"
 export CXXFLAGS="$CFLAGS"
+# Builds made here update themselves from GitHub releases (src/update.rs).
+export KITH_RELEASE_BUILD=1
 # Its own target dir, so these flags don't force a full rebuild of dev builds.
 target=target/release-dist
 

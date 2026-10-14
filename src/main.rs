@@ -20,6 +20,8 @@ mod notify;
 mod player;
 #[cfg(not(target_os = "android"))]
 mod tray;
+#[cfg(not(target_os = "android"))]
+mod update;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Mutex};
 
@@ -115,6 +117,9 @@ enum Command {
     /// Remove what `install` added, and starting at login. Your code, friends
     /// and settings stay.
     Uninstall,
+    /// Install the newest release, if it's newer than this Kith. The
+    /// installed Kith does this by itself, the next time it starts.
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -218,7 +223,28 @@ fn app(
         default_hook(info);
     }));
 
-    let start = gui::Start { background, link };
+    // A new version downloaded while Kith last ran goes in now, before
+    // anything can be live, and starts as this one would have.
+    let updates = update::here();
+    if updates {
+        update::tidy();
+        if let Some(installed) = update::install_downloaded(&home) {
+            let mut args = home.args();
+            if background {
+                args.push(install::BACKGROUND.into());
+            }
+            if let Some(link) = &link {
+                args.extend(["open".into(), link.to_string()]);
+            }
+            return start_detached(&installed, &args);
+        }
+    }
+
+    let start = gui::Start {
+        background,
+        link,
+        updates,
+    };
     let args = home.args();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         gui::run(runtime, home, start)
@@ -529,8 +555,12 @@ async fn run(home: Home, command: Command) -> Result<()> {
         }
         #[cfg(not(target_os = "android"))]
         Command::Uninstall => uninstall(&socket).await?,
+        #[cfg(not(target_os = "android"))]
+        Command::Update => update_now(&home).await?,
         #[cfg(target_os = "android")]
-        Command::Install | Command::Uninstall => bail!("there's nothing to install on Android"),
+        Command::Install | Command::Uninstall | Command::Update => {
+            bail!("there's nothing to install on Android")
+        }
         Command::Open { .. } => unreachable!("main opens the app"),
     }
     Ok(())
@@ -598,6 +628,39 @@ async fn reload(socket: &std::path::Path) -> Result<bool> {
         Some(_) => Ok(true),
         None => Ok(false),
     }
+}
+
+/// `kith update`: installs the newest release, when it's newer than this Kith.
+#[cfg(not(target_os = "android"))]
+async fn update_now(home: &Home) -> Result<()> {
+    let source = update::Source::get().with_context(|| {
+        format!(
+            "this Kith was built from source, so it doesn't update itself. Releases are at {}/releases",
+            env!("CARGO_PKG_REPOSITORY")
+        )
+    })?;
+    let Some(release) = update::check(&source).await? else {
+        println!("Kith {} is up to date.", install::version());
+        return Ok(());
+    };
+    println!("Kith {} is out. Downloading it…", release.version);
+    let download = (release.version, update::download(&source, &release).await?);
+    let installed = {
+        let home = home.clone();
+        tokio::task::spawn_blocking(move || update::install(&download, &home)).await??
+    };
+    println!(
+        "Installed Kith {} as {}",
+        release.version,
+        installed.display()
+    );
+    if control::send(&home.socket_path(), &Request::Status)
+        .await?
+        .is_some()
+    {
+        println!("The Kith running now is the old one: `kith quit`, then open Kith again.");
+    }
+    Ok(())
 }
 
 /// `kith uninstall`, which Windows' Apps list runs too, with no console to

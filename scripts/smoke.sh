@@ -2,9 +2,10 @@
 # End-to-end smoke test on one machine: three identities (alice streams, bob
 # watches, carol is a stranger) talking over real iroh connections.
 #
-# Needs ffmpeg, ffprobe and mpv, plus dbus-daemon and python3-gi for the D-Bus
-# notification check. Nothing pops up on screen: mpv runs with null
-# outputs, and fake notification servers stand in for the desktop's.
+# Needs ffmpeg, ffprobe, mpv, python3 and openssl, plus dbus-daemon and
+# python3-gi for the D-Bus notification check. Nothing pops up on screen: mpv
+# runs with null outputs, and fake notification servers stand in for the
+# desktop's.
 # Holepunching between two processes on one host is trivial, so this proves
 # the plumbing (identity, friend gate, MoQ announce/subscribe, TS import and
 # export, the control socket and handoff to `up`, auto-open and notification
@@ -322,7 +323,7 @@ again=$(kith dave name Dave && kith dave join "$link" 2>&1)
 #     A throwaway $HOME stands in for the real one.
 F=$T/installhome
 mkdir -p "$F"
-as_user() { env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$F" "$@"; }
+as_user() { env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$F" "$@"; }
 as_user "$KITH" install >/dev/null
 entry=$F/.local/share/applications/kith.desktop
 if [[ -x $F/.local/bin/kith ]] && grep -qx 'MimeType=x-scheme-handler/kith;' "$entry" \
@@ -339,6 +340,94 @@ if [[ ! -e $F/.local/bin/kith && ! -e $entry && ! -e $F/.local/share/icons/hicol
 else
     fail "uninstall left files in $F"
 fi
+
+# 13. Updating, from a stand-in release server and with a test key in place
+#     of Kith's own (debug builds take both from the environment).
+openssl genpkey -algorithm ed25519 -out "$T/update-key.pem" 2>/dev/null
+UKEY=$(openssl pkey -in "$T/update-key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+SITE=$T/site
+mkdir -p "$SITE"
+UPORT=$((20000 + RANDOM % 20000))
+python3 -m http.server "$UPORT" --bind 127.0.0.1 --directory "$SITE" >"$T/site.log" 2>&1 &
+PIDS+=($!)
+deadline=$((SECONDS + 10))
+until curl -sf "http://127.0.0.1:$UPORT/" >/dev/null || ((SECONDS > deadline)); do sleep 0.2; done
+# An array rather than a function, so `timeout` can run it too.
+updating=(env -u XDG_DATA_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME HOME="$F"
+    KITH_UPDATE_URL="http://127.0.0.1:$UPORT" KITH_UPDATE_KEY="$UKEY")
+# This build as release 99.0.0, laid out as GitHub serves releases. It's
+# packed once: a debug build is most of a gigabyte.
+name=kith-99.0.0-linux-x86_64
+ARCHIVE=$SITE/releases/download/v99.0.0/$name.tar.gz
+mkdir -p "$T/pack/$name" "${ARCHIVE%/*}" "$SITE/releases/latest/download"
+cp "$KITH" "$T/pack/$name/kith"
+tar -C "$T/pack" -czf "$ARCHIVE" "$name"
+HASH=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+# Makes release $1 the latest, its SHA256SUMS signed with the test key and
+# giving hash $2 for its archive (the real one's, by default).
+latest() {
+    local sums=$SITE/releases/latest/download/SHA256SUMS
+    printf '%s  kith-%s-linux-x86_64.tar.gz\n' "${2:-$HASH}" "$1" >"$sums"
+    openssl pkeyutl -sign -inkey "$T/update-key.pem" -rawin -in "$sums" -out "$sums.sig"
+}
+DOWNLOADS=$F/.cache/kith/update
+
+latest 0.0.1
+said=$("${updating[@]}" "$KITH" update 2>&1)
+[[ $said == *"is up to date"* ]] && pass "update: an older release leaves Kith as it is" \
+    || fail "update from an older release: $said"
+
+latest 99.0.0
+printf '\n' >>"$SITE/releases/latest/download/SHA256SUMS"
+said=$("${updating[@]}" "$KITH" update 2>&1)
+if [[ $said == *"isn't signed with Kith's release key"* && ! -e $F/.local/bin/kith ]]; then
+    pass "update: a SHA256SUMS changed after signing is refused"
+else
+    fail "update with a tampered SHA256SUMS: $said"
+fi
+latest 99.0.0 "$(printf '%064d' 0)"
+said=$("${updating[@]}" "$KITH" update 2>&1)
+if [[ $said == *"doesn't match the release's SHA256SUMS"* && ! -e $F/.local/bin/kith ]]; then
+    pass "update: an archive that doesn't match SHA256SUMS is refused"
+else
+    fail "update with a mismatched archive: $said"
+fi
+
+latest 99.0.0
+said=$("${updating[@]}" "$KITH" update 2>&1)
+if [[ $said == *"Installed Kith 99.0.0 as $F/.local/bin/kith"* && -x $F/.local/bin/kith ]] \
+    && [[ -f $F/.local/share/applications/kith.desktop && ! -e $DOWNLOADS/99.0.0 ]]; then
+    pass "update: downloaded, checked and installed a signed release"
+else
+    fail "update: $said"
+fi
+
+# A download from an earlier run goes in as the installed Kith starts, which
+# then starts the new one the same way (here in the background, with no tray)
+# and leaves it running.
+mkdir -p "$DOWNLOADS"
+tar -C "$DOWNLOADS" -xzf "$ARCHIVE"
+mv "$DOWNLOADS/$name" "$DOWNLOADS/99.0.0"
+DBUS_SESSION_BUS_ADDRESS=disabled timeout 60 "${updating[@]}" "$F/.local/bin/kith" --background \
+    >"$T/update-start.log" 2>&1
+started=$?
+deadline=$((SECONDS + 30))
+until [[ $("${updating[@]}" "$F/.local/bin/kith" status 2>&1) == *"live: no"* ]] || ((SECONDS > deadline)); do
+    sleep 0.5
+done
+if ((started == 0)) && [[ ! -e $DOWNLOADS/99.0.0 ]] \
+    && grep -q 'installing Kith 99.0.0, downloaded earlier' "$F/.config/kith/kith.log"* \
+    && [[ $("${updating[@]}" "$F/.local/bin/kith" status 2>&1) == *"live: no"* ]]; then
+    pass "update: a download from last time installed as Kith started, and the new one runs"
+else
+    fail "update as Kith starts: exit $started, status $("${updating[@]}" "$F/.local/bin/kith" status 2>&1 | head -1) (see $T/update-start.log and $F/.config/kith)"
+fi
+"${updating[@]}" "$F/.local/bin/kith" quit >/dev/null 2>&1
+deadline=$((SECONDS + 10))
+while pgrep -f "$F/.local/bin/kit[h]" >/dev/null && ((SECONDS < deadline)); do sleep 0.3; done
+pkill -f "$F/.local/bin/kit[h]" 2>/dev/null
+as_user "$KITH" uninstall >/dev/null
+[[ ! -e $F/.cache/kith ]] && pass "uninstall removed the downloads" || fail "uninstall left $F/.cache/kith"
 
 if ((FAILED)); then
     echo "logs kept in $T"

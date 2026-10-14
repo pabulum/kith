@@ -4,8 +4,8 @@
 # home, signals) without a Windows machine. Wine networking is the host's, so
 # like smoke.sh this proves plumbing, not NAT traversal.
 #
-# Needs wine, the x86_64-pc-windows-gnu rustup target, mingw-w64-gcc, ffmpeg
-# and ffprobe. Uses a throwaway Wine prefix, so ~/.wine is never touched.
+# Needs wine, the x86_64-pc-windows-gnu rustup target, mingw-w64-gcc, ffmpeg,
+# ffprobe, python3, openssl and bsdtar. Uses a throwaway Wine prefix, so ~/.wine is never touched.
 # Given a Windows ffmpeg.exe, it also streams from the Windows build.
 # Usage: scripts/wine-smoke.sh [path/to/ffmpeg.exe]
 set -uo pipefail
@@ -171,6 +171,45 @@ if [[ -n $WIN_FFMPEG ]]; then
 else
     echo "SKIP  streaming from Windows (pass a Windows ffmpeg.exe to run it)"
 fi
+
+# 7. Updating the installed Kith while it runs `up`, from a stand-in release
+#    server with a test key in place of Kith's own (debug builds take both
+#    from the environment). Windows won't overwrite a running program, so the
+#    new one goes in after the running one moves aside.
+openssl genpkey -algorithm ed25519 -out "$T/update-key.pem" 2>/dev/null
+export KITH_UPDATE_KEY=$(openssl pkey -in "$T/update-key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+SITE=$T/site
+name=kith-99.0.0-windows-x86_64
+mkdir -p "$T/pack/$name" "$SITE/releases/download/v99.0.0" "$SITE/releases/latest/download"
+cp "$EXE" "$T/pack/$name/kith.exe"
+(cd "$T/pack" && bsdtar -a -cf "$SITE/releases/download/v99.0.0/$name.zip" "$name")
+(cd "$SITE/releases/download/v99.0.0" && sha256sum "$name.zip") >"$SITE/releases/latest/download/SHA256SUMS"
+openssl pkeyutl -sign -inkey "$T/update-key.pem" -rawin -in "$SITE/releases/latest/download/SHA256SUMS" \
+    -out "$SITE/releases/latest/download/SHA256SUMS.sig"
+UPORT=$((20000 + RANDOM % 20000))
+python3 -m http.server "$UPORT" --bind 127.0.0.1 --directory "$SITE" >"$T/site.log" 2>&1 &
+PIDS+=($!)
+export KITH_UPDATE_URL=http://127.0.0.1:$UPORT
+timeout 60 wine "$EXE" install >/dev/null 2>&1
+wine "$INSTALLED" up >"$T/win-up2.out" 2>"$T/win-up2.log" &
+PIDS+=($!)
+WIN_UP=$!
+wait_for "$T/win-up2.out" 'Kith is up' 30 || fail "the installed Kith didn't start"
+said=$(timeout 120 wine "$INSTALLED" update 2>&1 | tr -d '\r')
+version=$(wine reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Kith' /v DisplayVersion 2>/dev/null | tr -d '\r')
+if [[ $said == *"Installed Kith 99.0.0"* && -f $INSTALLED.old && $version == *DisplayVersion* ]] \
+    && [[ ! -e $U/AppData/Local/Kith/update/99.0.0 ]] \
+    && [[ $(timeout 60 wine "$INSTALLED" --version 2>/dev/null | tr -d '\r') == "kith "* ]]; then
+    pass "update: installed a signed release over the running Kith, which moved aside"
+else
+    fail "update: $said (old program moved aside: $([[ -f $INSTALLED.old ]] && echo yes || echo no))"
+fi
+timeout 30 wine "$INSTALLED" quit >/dev/null 2>&1
+deadline=$((SECONDS + 15))
+while kill -0 "$WIN_UP" 2>/dev/null && ((SECONDS < deadline)); do sleep 0.3; done
+kill -TERM "$WIN_UP" 2>/dev/null; wait "$WIN_UP" 2>/dev/null
+timeout 60 wine "$INSTALLED" uninstall >/dev/null 2>&1
+wineserver -k 2>/dev/null
 
 if ((FAILED)); then
     echo "logs kept in $T"

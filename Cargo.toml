@@ -33,6 +33,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = "0.36"
 # Already in the tree through egui's links; opens the browser fallback player.
 webbrowser = "1.2"
+# The updater's downloads and their checksums. Both are in the tree already
+# through iroh, reqwest with the features iroh builds it with: iroh supplies
+# its TLS setup.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+sha2 = "0.11"
 
 # The tray icon and notifications speak D-Bus. zbus is already in the tree
 # for egui's accessibility support, running on its own executor (async-io);
@@ -41,6 +46,9 @@ webbrowser = "1.2"
 futures-util = "0.3"
 ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 zbus = { version = "5", default-features = false, features = ["async-io"] }
+# Unpacking an update: the release's .tar.gz.
+flate2 = "1"
+tar = { version = "0.4.46", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # Desktop sound for streaming, which ffmpeg can't record on Windows: WASAPI
@@ -70,6 +78,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# Unpacking an update: the release's .zip.
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2"] }
 
 [profile.release]
 # Symbol names are half the Windows exe, and panics still say where they happened.

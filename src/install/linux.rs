@@ -58,6 +58,15 @@ fn desktop_file() -> Option<PathBuf> {
     Some(applications()?.join("kith.desktop"))
 }
 
+/// Kith's cache, `$XDG_CACHE_HOME/kith`, which holds downloaded updates.
+fn cache() -> Option<PathBuf> {
+    Some(xdg("CACHE", ".cache")?.join("kith"))
+}
+
+pub fn update_dir() -> Option<PathBuf> {
+    Some(cache()?.join("update"))
+}
+
 fn hicolor() -> Option<PathBuf> {
     Some(xdg("DATA", ".local/share")?.join("icons/hicolor"))
 }
@@ -186,6 +195,9 @@ pub fn uninstall() -> Result<Vec<String>> {
         .collect();
     if !icons.is_empty() {
         removed.push("the icon".into());
+    }
+    if let Some(cache) = cache() {
+        let _ = fs::remove_dir_all(cache);
     }
     if let Some(applications) = applications() {
         quietly(

@@ -47,6 +47,12 @@ fn install_dir() -> Option<PathBuf> {
     Some(env_dir("LOCALAPPDATA")?.join(r"Programs\Kith"))
 }
 
+/// Downloaded updates, in %LOCALAPPDATA%\Kith with the icon notifications
+/// show, which uninstalling removes.
+pub fn update_dir() -> Option<PathBuf> {
+    Some(env_dir("LOCALAPPDATA")?.join(r"Kith\update"))
+}
+
 fn shortcut() -> Option<PathBuf> {
     Some(env_dir("APPDATA")?.join(r"Microsoft\Windows\Start Menu\Programs\Kith.lnk"))
 }
@@ -145,6 +151,19 @@ fn put(from: &Path, to: &Path) -> Result<()> {
     fs::copy(from, to).with_context(|| format!("copying {}", to.display()))?;
     let _ = fs::remove_file(&aside);
     Ok(())
+}
+
+/// Removes the programs [`put`] moved aside while they ran, now that the
+/// installed Kith has restarted without them.
+pub fn tidy() {
+    let Some(entries) = install_dir().and_then(|dir| fs::read_dir(dir).ok()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().is_some_and(|ext| ext == "old") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub fn uninstall() -> Result<Vec<String>> {

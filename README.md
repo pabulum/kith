@@ -78,8 +78,9 @@ run `rustup target add x86_64-pc-windows-gnu`, install mingw-w64
 Run `kith` with no arguments (on Windows, double-click `kith.exe`).
 The window shows your code, your friends, and who's live. The first time,
 it offers to **Install** itself: into the Start menu on Windows (Settings →
-Apps removes it again), or your app menu on Linux. Opening a newer Kith
-later offers to **Update** the installed one.
+Apps removes it again), or your app menu on Linux. Installed, it keeps
+itself up to date: it downloads a new version by itself, and installs it the
+next time it starts, or when you click **Restart to update**.
 
 1. Fill in **Your name**, click **Invite a friend**, and send the link it
    copies to one friend. They paste it into **Add a friend** (or click it,
@@ -125,6 +126,7 @@ kith status                           # who's online or live, and whether it's d
 kith quit                             # stop Kith: the window, the tray icon, or `kith up`
 kith install                          # into the Start menu or app menu (~/.local/bin on Linux)
 kith uninstall                        # ...and out again; your code and friends stay
+kith update                           # install the newest version now, if there's a newer one
 ```
 
 While Kith runs (the app, or `kith up`), the other commands go through it.
@@ -164,6 +166,8 @@ on Windows. It holds `config.toml`, your key (`secret.key`) and the log
   instead of the built-in one, which writes MPEG-TS (H.264 or HEVC video,
   AAC audio) to standard output. `encoder` and `silence` don't apply to it.
 - `latency`: how far behind live you watch by default.
+- `updates`: not set by default, which leaves updating on. `false` stops
+  Kith updating itself, as does unticking **Keep Kith up to date**.
 - `[[invite]]`: the invites you've made that nobody has used yet.
 
 `--home <dir>` or `KITH_HOME` uses another folder, which is how one
@@ -190,6 +194,10 @@ add your new code.
   who make iroh: the relays, and a directory that maps your code to the relay
   you're using (not to your IP address). The relays are rate-limited, and
   Kith can't use one of your own yet.
+- **Kith asks GitHub for new versions** every few hours, so GitHub sees your
+  IP address then. It installs only versions signed with Kith's release key,
+  which isn't kept on GitHub. **Keep Kith up to date**, under Settings, turns
+  this off.
 - **The log** has your friends' names and codes. Read it before you share it.
 
 ## Troubleshooting
@@ -220,9 +228,12 @@ scripts/wine-smoke.sh path/to/ffmpeg.exe   # ...and streaming from Windows too
 scripts/windows-smoke.sh path/to/ffmpeg.exe  # on real Windows, in Git Bash (CI runs it)
 scripts/ffmpeg-windows.sh  # the trimmed ffmpeg.exe, built in a container
 scripts/release.sh       # the release in dist/, with third-party licenses
+scripts/publish.sh v0.1.0  # sign a drafted release for the updater, and publish it
 ```
 
 A tag like `v0.1.0` builds the release on GitHub and drafts it there.
+`scripts/publish.sh` then signs its `SHA256SUMS` with the key installed
+Kiths check updates against, and publishes it.
 
 ## License
 

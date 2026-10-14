@@ -118,6 +118,26 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Whether this program is the installed Kith.
+pub fn running_installed() -> bool {
+    let exe = std::env::current_exe();
+    installed().is_some_and(|installed| exe.is_ok_and(|exe| same_file(&exe, &installed.exe)))
+}
+
+/// Where the updater keeps what it downloads, which uninstalling removes.
+pub fn update_dir() -> Option<PathBuf> {
+    #[cfg(any(target_os = "linux", windows))]
+    return system::update_dir();
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Removes what an update left behind in the installed Kith's folder.
+pub fn tidy() {
+    #[cfg(windows)]
+    system::tidy();
+}
+
 /// Installs this program for the user, or updates the installed one to it,
 /// and returns the installed program: what to start once this one quits.
 pub fn install(home: &Home) -> Result<PathBuf> {

@@ -21,11 +21,11 @@ use crate::{
     capture::{self, Recorder, Share},
     config::{Config, Home},
     control::{self, Request},
-    install,
+    install::{self, Version},
     invite::{self, Invite},
     link::Link,
     node::{Capture, FriendState, Node, Presence, Role, Sink},
-    notify, player, tray,
+    notify, player, tray, update,
 };
 
 /// How often the window re-reads the node's state. A snapshot is a few mutex
@@ -46,6 +46,8 @@ pub struct Start {
     pub background: bool,
     /// A `kith://` link to follow once connected.
     pub link: Option<Link>,
+    /// This Kith updates itself ([`update::here`]).
+    pub updates: bool,
 }
 
 /// Runs the app until it quits. Returns a program to start then: the
@@ -61,6 +63,13 @@ pub fn run(runtime: Runtime, home: Home, start: Start) -> Result<Option<PathBuf>
         window.clone(),
         start.link,
     ));
+    if start.updates {
+        shared.0.lock().unwrap().updates.here = true;
+        let shared = shared.clone();
+        runtime.spawn(update::keep_checking(home.clone(), move |version| {
+            shared.0.lock().unwrap().updates.ready = Some(version);
+        }));
+    }
     runtime.spawn_blocking({
         let shared = shared.clone();
         move || {
@@ -371,9 +380,21 @@ struct Inner {
     recorder: Option<Result<Recorder, String>>,
     /// Install or Update was put off until next time.
     install_later: bool,
+    updates: Updates,
     /// The stream failure last put in the message bar, so it shows once,
     /// even when it happened with the window closed.
     shown_stream_error: Option<String>,
+}
+
+/// Kith updating itself, where it does.
+#[derive(Default)]
+struct Updates {
+    /// This Kith updates itself, so the window has the setting.
+    here: bool,
+    /// A new version, downloaded: it installs when Kith next starts.
+    ready: Option<Version>,
+    /// Restart to update was clicked, and it's installing.
+    installing: bool,
 }
 
 #[derive(Clone, Default)]
@@ -447,6 +468,8 @@ struct App {
     offer: Option<install::Offer>,
     /// Kith is installed, so it can be uninstalled.
     installed: bool,
+    /// The `updates` setting: Kith updates itself.
+    keep_updated: bool,
     /// Uninstall was clicked once and awaits confirmation.
     uninstalling: bool,
     /// What friends see you as, while being edited.
@@ -498,7 +521,9 @@ impl eframe::App for App {
 
 impl App {
     fn new(runtime: Handle, home: Home, shared: Shared, window: AppWindow, stays: Stays) -> Self {
-        let own_name = home.config().map(|config| config.name).unwrap_or_default();
+        let config = home.config().ok();
+        let own_name = config.as_ref().map(|config| config.name.clone());
+        let keep_updated = config.is_none_or(|config| config.updates);
         Self {
             runtime,
             home,
@@ -508,8 +533,9 @@ impl App {
             autostart: install::autostart(),
             offer: install::offer(),
             installed: install::installed().is_some(),
+            keep_updated,
             uninstalling: false,
-            own_name,
+            own_name: own_name.unwrap_or_default(),
             name: String::new(),
             code: String::new(),
             auto_open: false,
@@ -540,6 +566,14 @@ impl App {
         }
 
         self.install_banner(ui);
+        let busy = if snapshot.live {
+            Some("Restarting would end your stream.")
+        } else if snapshot.friends.iter().any(|state| state.watching) {
+            Some("Restarting would close the stream you're watching.")
+        } else {
+            None
+        };
+        self.update_banner(ui, busy);
         if self.browser_fallback() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
@@ -631,6 +665,61 @@ impl App {
         ui.separator();
     }
 
+    /// A new version, downloaded: it installs the next time Kith starts, or
+    /// now with a restart, unless that would end a stream (`busy` says).
+    fn update_banner(&mut self, ui: &mut egui::Ui, busy: Option<&str>) {
+        let (ready, installing) = {
+            let updates = &self.shared.0.lock().unwrap().updates;
+            (updates.ready, updates.installing)
+        };
+        let Some(version) = ready.filter(|_| self.keep_updated) else {
+            return;
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Kith {version} is ready."))
+                .on_hover_text("It installs itself the next time Kith starts.");
+            if installing {
+                ui.spinner();
+                ui.label("Updating…");
+            } else {
+                let button = ui.add_enabled(
+                    busy.is_none(),
+                    egui::Button::new(RichText::new("Restart to update").strong()),
+                );
+                if button
+                    .on_disabled_hover_text(busy.unwrap_or_default())
+                    .clicked()
+                {
+                    self.update_now();
+                }
+            }
+            ui.hyperlink_to("What's new", update::notes(version));
+        });
+        ui.separator();
+    }
+
+    /// Installs the downloaded version, then quits into it.
+    fn update_now(&self) {
+        self.shared.0.lock().unwrap().updates.installing = true;
+        let (home, shared, window) = (self.home.clone(), self.shared.clone(), self.window.clone());
+        self.runtime.spawn_blocking(move || {
+            let installed = update::downloaded()
+                .ok_or_else(|| anyhow!("the download is gone; Kith fetches it again soon"))
+                .and_then(|download| update::install(&download, &home));
+            match installed {
+                Ok(program) => window.quit_into(program),
+                Err(err) => {
+                    let mut inner = shared.0.lock().unwrap();
+                    inner.updates = Updates {
+                        here: true,
+                        ..Updates::default()
+                    };
+                    inner.message = Some(Message::Problem(format!("Updating Kith: {err:#}")));
+                }
+            }
+        });
+    }
+
     fn settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         let mut autostart = self.autostart;
@@ -652,6 +741,34 @@ impl App {
                         "Kith will start when you log in."
                     } else {
                         "Kith won't start when you log in."
+                    };
+                    self.shared.say(Message::Info(news.into()));
+                }
+                Err(err) => self.shared.say(Message::Problem(format!("{err:#}"))),
+            }
+        }
+        let updates_here = self.shared.0.lock().unwrap().updates.here;
+        let mut keep_updated = self.keep_updated;
+        if updates_here
+            && ui
+                .checkbox(&mut keep_updated, "Keep Kith up to date")
+                .on_hover_text(
+                    "Every few hours, Kith asks GitHub for a new version. When there is one, \
+                     it downloads it, and installs it the next time Kith starts.",
+                )
+                .changed()
+        {
+            let saved = self.home.edit(|config| {
+                config.updates = keep_updated;
+                Ok(())
+            });
+            match saved {
+                Ok(()) => {
+                    self.keep_updated = keep_updated;
+                    let news = if keep_updated {
+                        "Kith will keep itself up to date."
+                    } else {
+                        "Kith won't update itself. New versions are on its GitHub page."
                     };
                     self.shared.say(Message::Info(news.into()));
                 }

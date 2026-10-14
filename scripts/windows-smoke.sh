@@ -7,7 +7,7 @@
 # runner; it runs anywhere Git for Windows' bash does.
 #
 # It installs Kith for this user and uninstalls it again, so on your own PC
-# it replaces an installed Kith.
+# it replaces an installed Kith. Besides Git Bash's tools it needs Python.
 # Usage: scripts/windows-smoke.sh path/to/ffmpeg.exe [path/to/kith.exe]
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -30,6 +30,7 @@ PIDS=()
 cleanup() {
     kith alice quit >/dev/null 2>&1
     kith bob quit >/dev/null 2>&1
+    kith carol quit >/dev/null 2>&1
     sleep 2
     for pid in "${PIDS[@]}"; do kill -9 "$pid" 2>/dev/null; done
 }
@@ -135,6 +136,45 @@ if [[ ! -e $PROGRAMS/kith.exe && ! -e $LINK ]] \
 else
     fail "uninstall left: $(ls "$PROGRAMS" 2>&1 | tr '\n' ' ') shortcut=$([[ -e $LINK ]] && echo yes)"
 fi
+
+# 5. Updating the installed Kith while it runs `up`, from a stand-in release
+#    server with a test key in place of Kith's own (debug builds take both
+#    from the environment). Windows won't overwrite a running program, so the
+#    new one goes in after the running one moves aside.
+openssl genpkey -algorithm ed25519 -out "$T/update-key.pem" 2>/dev/null
+export KITH_UPDATE_KEY=$(openssl pkey -in "$T/update-key.pem" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n')
+SITE=$T/site
+name=kith-99.0.0-windows-x86_64
+mkdir -p "$T/pack/$name" "$SITE/releases/download/v99.0.0" "$SITE/releases/latest/download"
+cp "$KITH" "$FFMPEG" "$T/pack/$name/"
+python -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2], sys.argv[3])' \
+    "$(cygpath -w "$SITE/releases/download/v99.0.0/$name")" "$(cygpath -w "$T/pack")" "$name"
+(cd "$SITE/releases/download/v99.0.0" && sha256sum "$name.zip") >"$SITE/releases/latest/download/SHA256SUMS"
+openssl pkeyutl -sign -inkey "$T/update-key.pem" -rawin -in "$SITE/releases/latest/download/SHA256SUMS" \
+    -out "$SITE/releases/latest/download/SHA256SUMS.sig"
+UPORT=$((20000 + RANDOM % 20000))
+python -m http.server "$UPORT" --bind 127.0.0.1 --directory "$(cygpath -w "$SITE")" >"$T/site.log" 2>&1 &
+PIDS+=($!)
+deadline=$((SECONDS + 20))
+until curl -sf "http://127.0.0.1:$UPORT/" >/dev/null || ((SECONDS > deadline)); do sleep 0.5; done
+export KITH_UPDATE_URL=http://127.0.0.1:$UPORT
+"$KITH" install >/dev/null
+"$PROGRAMS/kith.exe" --home "$(home carol)" up >"$T/carol-up.out" 2>"$T/carol-up.log" &
+PIDS+=($!)
+wait_for "$T/carol-up.out" 'Kith is up' 60 || fail "the installed Kith didn't start"
+said=$("$PROGRAMS/kith.exe" update 2>&1 | tr -d '\r')
+if [[ $said == *"Installed Kith 99.0.0"* && -f $PROGRAMS/kith.exe.old && -f $PROGRAMS/ffmpeg.exe ]] \
+    && [[ ! -e $(cygpath "$LOCALAPPDATA")/Kith/update/99.0.0 ]] \
+    && [[ $("$PROGRAMS/kith.exe" --version | tr -d '\r') == "kith "* ]]; then
+    pass "update: installed a signed release over the running Kith, which moved aside"
+else
+    fail "update: $said (old program moved aside: $([[ -f $PROGRAMS/kith.exe.old ]] && echo yes || echo no))"
+fi
+kith carol quit >/dev/null
+sleep 2
+"$PROGRAMS/kith.exe" uninstall >/dev/null
+deadline=$((SECONDS + 30))
+while [[ -e $PROGRAMS/kith.exe ]] && ((SECONDS < deadline)); do sleep 1; done
 
 if ((FAILED)); then
     echo "logs kept in $T"
